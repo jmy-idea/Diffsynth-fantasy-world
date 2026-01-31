@@ -50,12 +50,16 @@ class SimpleAdapter(nn.Module):
         height: int,
         width: int,
         speed: float = 1/54,
-        origin=(0, 0.532139961, 0.946026558, 0.5, 0.5, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0)
+        origin=(0, 0.532139961, 0.946026558, 0.5, 0.5, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0),
+        pose_file_path=None,
     ):
         if origin is None:
             origin = (0, 0.532139961, 0.946026558, 0.5, 0.5, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0)
-        coordinates = generate_camera_coordinates(direction, length, speed, origin)
-        plucker_embedding = process_pose_file(coordinates, width, height)
+        if pose_file_path is not None:
+            plucker_embedding = process_pose_file(pose_file_path=pose_file_path, width=width, height=height)
+        else:
+            coordinates = generate_camera_coordinates(direction, length, speed, origin)
+            plucker_embedding = process_pose_file(cam_params=coordinates, width=width, height=height)
         return plucker_embedding
         
     
@@ -83,6 +87,14 @@ class Camera(object):
         self.fy = fy
         self.cx = cx
         self.cy = cy
+
+        # # 归一化内参
+        # self.fx = fx / cx /2  # fx / cx
+        # self.cx = cx / cx /2  # cx / cx = 1
+
+        # self.fy = fy / cy /2  # fy / cy
+        # self.cy = cy / cy /2  # cy / cy = 1
+
         w2c_mat = np.array(entry[7:]).reshape(3, 4)
         w2c_mat_4x4 = np.eye(4)
         w2c_mat_4x4[:3, :] = w2c_mat
@@ -147,7 +159,16 @@ def ray_condition(K, c2w, H, W, device):
     return plucker
 
 
-def process_pose_file(cam_params, width=672, height=384, original_pose_width=1280, original_pose_height=720, device='cpu', return_poses=False):
+def process_pose_file(pose_file_path=None, cam_params=None, width=672, height=384, original_pose_width=1280, original_pose_height=720, device='cpu', return_poses=False):
+    """Modified from https://github.com/hehao13/CameraCtrl/blob/main/inference.py
+    """
+    if pose_file_path is not None:
+        with open(pose_file_path, 'r') as f:
+            poses = f.readlines()
+
+        poses = [pose.strip().split(' ') for pose in poses if pose.strip()]
+        cam_params = [[float(x) for x in pose] for pose in poses]
+        
     if return_poses:
         return cam_params
     else:

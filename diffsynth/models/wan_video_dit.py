@@ -230,6 +230,182 @@ class DiTBlock(nn.Module):
         x = self.gate(x, gate_mlp, self.ffn(input_x))
         return x
 
+# =============================================================================
+# Fantasy World复现
+class PoseEncoder(nn.Module):
+    def __init__(self, dim, input_dim=9):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim)
+        )
+
+    def forward(self, x):
+        return self.mlp(x)
+
+class MMBiCrossAttention(nn.Module):
+    def __init__(self, dim, num_heads):
+        super().__init__()
+        self.cross_attn_v2g = CrossAttention(dim, num_heads)
+        self.cross_attn_g2v = CrossAttention(dim, num_heads)
+        # Zero init
+        nn.init.zeros_(self.cross_attn_v2g.o.weight)
+        nn.init.zeros_(self.cross_attn_g2v.o.weight)
+
+    def forward(self, x_video, x_geo):
+        attn_v = self.cross_attn_v2g(x_video, x_geo)
+        attn_g = self.cross_attn_g2v(x_geo, x_video)
+        return x_video + attn_v, x_geo + attn_g
+
+# --- DPT Head Utilities ---
+
+def inverse_log_transform(y):
+    return torch.sign(y) * (torch.expm1(torch.abs(y)))
+
+def activate_head(out, activation="inv_log", conf_activation="expp1"):
+    # out: B, C, H, W (or B S C H W flattened?)
+    # DPTHead output conv uses output_dim.
+    # We assume out is [B*S, output_dim, H, W] inside DPTHead, 
+    # but DPTHead.forward reshapes to [B, S, C, H, W].
+    # So out here is [B, S, C, H, W]???
+    # No, inside DPTHead.forward:
+    # out = self.scratch.output_conv2(out) -> [B*S, C, H, W]
+    # preds, conf = activate_head(out, ...)
+    
+    fmap = out.permute(0, 2, 3, 1) # B*S, H, W, C
+    xyz = fmap[..., :-1]
+    conf = fmap[..., -1:] # Keep dim? VGGT uses [..., -1] reducing dim.
+    # But we want [B, S, C-1, H, W].
+    
+    # Let's align with VGGT logic:
+    # xyz: B*S, H, W, 3
+    # conf: B*S, H, W, 1 (if keeping dim)
+    
+    if activation == "inv_log":
+        pts3d = inverse_log_transform(xyz)
+    elif activation == "exp":
+        pts3d = torch.exp(xyz)
+    else:
+        pts3d = xyz
+        
+    if conf_activation == "expp1":
+        conf_out = 1 + conf.exp()
+    elif conf_activation == "expp0":
+        conf_out = conf.exp()
+    else:
+        conf_out = conf
+        
+    # Reshape back to channel first for consistency with PyTorch [B*S, C, H, W]
+    pts3d = pts3d.permute(0, 3, 1, 2)
+    conf_out = conf_out.permute(0, 3, 1, 2)
+    
+    return pts3d, conf_out
+
+def create_uv_grid(width, height, aspect_ratio=1.0, dtype=torch.float32, device='cpu'):
+    xs = torch.linspace(0, 1, width, dtype=dtype, device=device)
+    ys = torch.linspace(0, 1, height, dtype=dtype, device=device)
+    # Correcting for aspect ratio if needed, but standard UV is 0-1
+    # VGGT logic usually keeps 0-1.
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
+    return torch.stack([grid_x, grid_y], dim=0) # 2, H, W
+
+def position_grid_to_embed(grid, dim_out):
+    # Simple projection or sinusoidal. VGGT uses a projection.
+    # Assuming simple projection for DPT:
+    # We can use a Conv2d or similar. But here let's assume DPTHead handles it.
+    # In VGGT `position_grid_to_embed` calls `get_2d_sincos_pos_embed` or similar?
+    # Actually DPTHead code called it.
+    # To save space, let's implement a learnable or fixed embedding.
+    # For now, let's omit complex pos embed if feature_only is sufficient or use a simple Sinusoidal.
+    # Placeholder:
+    return torch.zeros(1, dim_out, grid.shape[1], grid.shape[2], device=grid.device)
+
+# --- DPT Head ---
+
+class FeatureFusionBlock(nn.Module):
+    def __init__(self, features, activation, has_residual=True):
+        super().__init__()
+        self.has_residual = has_residual
+        self.resConfUnit1 = nn.Sequential(
+            activation, nn.Conv2d(features, features, 3, 1, 1),
+            activation, nn.Conv2d(features, features, 3, 1, 1)
+        ) if has_residual else None
+        self.resConfUnit2 = nn.Sequential(
+            activation, nn.Conv2d(features, features, 3, 1, 1),
+            activation, nn.Conv2d(features, features, 3, 1, 1)
+        )
+        self.out_conv = nn.Conv2d(features, features, 1, 1, 0)
+        
+    def forward(self, *xs, size=None):
+        output = xs[0]
+        if self.has_residual:
+            output = output + self.resConfUnit1(xs[1])
+        output = self.resConfUnit2(output)
+        if size is not None:
+             output = F.interpolate(output, size=size, mode="bilinear", align_corners=True)
+        return self.out_conv(output)
+
+class DPTHead(nn.Module):
+    def __init__(self, dim_in, output_dim=4, features=256, intermediate_layer_idx=[7, 11, 17, 23]):
+        super().__init__()
+        self.intermediate_layer_idx = intermediate_layer_idx
+        self.norm = nn.LayerNorm(dim_in)
+        
+        out_channels = [256, 512, 1024, 1024]
+        self.projects = nn.ModuleList([
+            nn.Conv2d(dim_in, oc, 1) for oc in out_channels
+        ])
+        self.resize_layers = nn.ModuleList([
+            nn.ConvTranspose2d(out_channels[0], out_channels[0], 4, 4),
+            nn.ConvTranspose2d(out_channels[1], out_channels[1], 2, 2),
+            nn.Identity(),
+            nn.Conv2d(out_channels[3], out_channels[3], 3, 2, 1)
+        ])
+        
+        # Scratch (RefineNet)
+        self.refinenet4 = FeatureFusionBlock(features, nn.ReLU(True), has_residual=False)
+        self.refinenet3 = FeatureFusionBlock(features, nn.ReLU(True))
+        self.refinenet2 = FeatureFusionBlock(features, nn.ReLU(True))
+        self.refinenet1 = FeatureFusionBlock(features, nn.ReLU(True))
+        
+        self.layer1_rn = nn.Conv2d(out_channels[0], features, 3, 1, 1)
+        self.layer2_rn = nn.Conv2d(out_channels[1], features, 3, 1, 1)
+        self.layer3_rn = nn.Conv2d(out_channels[2], features, 3, 1, 1)
+        self.layer4_rn = nn.Conv2d(out_channels[3], features, 3, 1, 1)
+
+        self.output_conv = nn.Sequential(
+            nn.Conv2d(features, features // 2, 3, 1, 1),
+            nn.Conv2d(features // 2, 32, 3, 1, 1),
+            nn.ReLU(True),
+            nn.Conv2d(32, output_dim, 1)
+        )
+
+    def forward(self, features_list, patch_h, patch_w):
+        # features_list: List of [B, S, D]
+        # We need to reshape to [B*S, D, H, W]
+        out = []
+        for i, idx in enumerate(self.intermediate_layer_idx):
+            x = features_list[i] # Already selected
+            b, s, d = x.shape
+            x = x.reshape(b*s, d, patch_h, patch_w) # Assuming already patches
+            x = self.projects[i](x)
+            x = self.resize_layers[i](x)
+            out.append(x)
+            
+        l1, l2, l3, l4 = out
+        l1 = self.layer1_rn(l1)
+        l2 = self.layer2_rn(l2)
+        l3 = self.layer3_rn(l3)
+        l4 = self.layer4_rn(l4)
+
+        o = self.refinenet4(l4, size=l3.shape[2:])
+        o = self.refinenet3(o, l3, size=l2.shape[2:])
+        o = self.refinenet2(o, l2, size=l1.shape[2:])
+        o = self.refinenet1(o, l1)
+        
+        return self.output_conv(o)
+# ===========================================================================
 
 class MLP(torch.nn.Module):
     def __init__(self, in_dim, out_dim, has_pos_emb=False):

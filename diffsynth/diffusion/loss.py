@@ -32,6 +32,81 @@ def DirectDistillLoss(pipe: BasePipeline, **inputs):
     loss = torch.nn.functional.mse_loss(inputs["latents"].float(), inputs["input_latents"].float())
     return loss
 
+# =============================================================================
+# Fantasy World复现
+def FantasyWorldLoss(pipe: BasePipeline, **inputs):
+    # 1. Video Diffusion Loss
+    # We ensure 'pose_params' is in inputs for FW injection
+    loss_diffusion = FlowMatchSFTLoss(pipe, **inputs)
+    
+    # 2. Geometry Branch Supervision
+    loss_geo = 0.0
+    
+    # Retrieve DPT outputs from the forward pass stored in the model
+    # (Note: FlowMatchSFTLoss calls model_fn which triggers the forward)
+    if hasattr(pipe.dit, 'last_dpt_output') and pipe.dit.last_dpt_output is not None:
+        pts_pred, pts_conf = pipe.dit.last_dpt_output
+        pipe.dit.last_dpt_output = None # Clear
+        
+        # pts_pred: [B, S, 3, H, W] (reshaped from [B*S])
+        # gt_points: [B, S, 3, H, W]
+        gt_points = inputs.get("gt_points", None)
+        
+        if gt_points is not None:
+            # Resize GT to match prediction resolution if necessary
+            if pts_pred.shape[-2:] != gt_points.shape[-2:]:
+                b, s, c, h, w = gt_points.shape
+                gt_points = torch.nn.functional.interpolate(
+                    gt_points.view(b*s, c, h, w), 
+                    size=pts_pred.shape[-2:], 
+                    mode='nearest'
+                ).view(b, s, c, *pts_pred.shape[-2:])
+            
+            # Mask valid points if needed (inputs['gt_valid_mask']?)
+            
+            # Point Map Loss (L_pmap)
+            # sum(|Conf * (P - G)| + |Conf * (GradP - GradG)| - gamma * log(Conf))
+            gamma = 0.1
+            
+            diff = (pts_pred - gt_points).abs()
+            loss_pts = (pts_conf * diff).mean()
+            
+            # Gradient Loss
+            def gradients(x):
+                dy = x[..., 1:, :] - x[..., :-1, :]
+                dx = x[..., :, 1:] - x[..., :, :-1]
+                return dx, dy
+                
+            dx_p, dy_p = gradients(pts_pred)
+            dx_g, dy_g = gradients(gt_points)
+            
+            # Align conf for gradients (slice to match size)
+            conf_dx = pts_conf[..., :, 1:]
+            conf_dy = pts_conf[..., 1:, :]
+            
+            loss_grad = (conf_dx * (dx_p - dx_g).abs()).mean() + \
+                        (conf_dy * (dy_p - dy_g).abs()).mean()
+            
+            # Regularization
+            loss_reg = -gamma * torch.log(pts_conf.clamp(min=1e-6)).mean()
+            
+            loss_geo = loss_pts + loss_grad + loss_reg
+            
+        # Depth Loss (Optional, using Z channel or separate GT)
+        gt_depth = inputs.get("gt_depth", None)
+        if gt_depth is not None:
+             # Basic L1
+             # Assuming Z is depth-like
+             depth_pred = pts_pred[:, :, 2:3] 
+             if depth_pred.shape[-2:] != gt_depth.shape[-2:]:
+                  # Resize
+                  pass
+             # loss_depth = F.l1_loss(depth_pred, gt_depth)
+             # loss_geo += loss_depth
+             pass
+
+    return loss_diffusion + loss_geo
+# =============================================================================
 
 class TrajectoryImitationLoss(torch.nn.Module):
     def __init__(self):

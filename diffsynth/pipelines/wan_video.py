@@ -11,7 +11,6 @@ from typing import Optional
 from typing_extensions import Literal
 from transformers import Wav2Vec2Processor
 
-from ..core.device.npu_compatible_device import get_device_type
 from ..diffusion import FlowMatchScheduler
 from ..core import ModelConfig, gradient_checkpoint_forward
 from ..diffusion.base_pipeline import BasePipeline, PipelineUnit
@@ -31,7 +30,7 @@ from ..models.longcat_video_dit import LongCatVideoTransformer3DModel
 
 class WanVideoPipeline(BasePipeline):
 
-    def __init__(self, device=get_device_type(), torch_dtype=torch.bfloat16):
+    def __init__(self, device="cuda", torch_dtype=torch.bfloat16):
         super().__init__(
             device=device, torch_dtype=torch_dtype,
             height_division_factor=16, width_division_factor=16, time_division_factor=4, time_division_remainder=1
@@ -99,7 +98,7 @@ class WanVideoPipeline(BasePipeline):
     @staticmethod
     def from_pretrained(
         torch_dtype: torch.dtype = torch.bfloat16,
-        device: Union[str, torch.device] = get_device_type(),
+        device: Union[str, torch.device] = "cuda",
         model_configs: list[ModelConfig] = [],
         tokenizer_config: ModelConfig = ModelConfig(model_id="Wan-AI/Wan2.1-T2V-1.3B", origin_file_pattern="google/umt5-xxl/"),
         audio_processor_config: ModelConfig = None,
@@ -123,15 +122,11 @@ class WanVideoPipeline(BasePipeline):
                     model_config.model_id = redirect_dict[model_config.origin_file_pattern][0]
                     model_config.origin_file_pattern = redirect_dict[model_config.origin_file_pattern][1]
         
+        # Initialize pipeline
+        pipe = WanVideoPipeline(device=device, torch_dtype=torch_dtype)
         if use_usp:
             from ..utils.xfuser import initialize_usp
             initialize_usp(device)
-            import torch.distributed as dist
-            from ..core.device.npu_compatible_device import get_device_name
-            if dist.is_available() and dist.is_initialized():
-                device = get_device_name()
-        # Initialize pipeline
-        pipe = WanVideoPipeline(device=device, torch_dtype=torch_dtype)
         model_pool = pipe.download_and_load_models(model_configs, vram_limit)
         
         # Fetch models
@@ -201,6 +196,7 @@ class WanVideoPipeline(BasePipeline):
         camera_control_direction: Optional[Literal["Left", "Right", "Up", "Down", "LeftUp", "LeftDown", "RightUp", "RightDown"]] = None,
         camera_control_speed: Optional[float] = 1/54,
         camera_control_origin: Optional[tuple] = (0, 0.532139961, 0.946026558, 0.5, 0.5, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0),
+        pose_file_path: Optional[str] = None,
         # VACE
         vace_video: Optional[list[Image.Image]] = None,
         vace_video_mask: Optional[Image.Image] = None,
@@ -268,6 +264,7 @@ class WanVideoPipeline(BasePipeline):
             "input_video": input_video, "denoising_strength": denoising_strength,
             "control_video": control_video, "reference_image": reference_image,
             "camera_control_direction": camera_control_direction, "camera_control_speed": camera_control_speed, "camera_control_origin": camera_control_origin,
+            "pose_file_path": pose_file_path,
             "vace_video": vace_video, "vace_video_mask": vace_video_mask, "vace_reference_image": vace_reference_image, "vace_scale": vace_scale,
             "seed": seed, "rand_device": rand_device,
             "height": height, "width": width, "num_frames": num_frames,
@@ -555,17 +552,17 @@ class WanVideoUnit_FunReference(PipelineUnit):
 class WanVideoUnit_FunCameraControl(PipelineUnit):
     def __init__(self):
         super().__init__(
-            input_params=("height", "width", "num_frames", "camera_control_direction", "camera_control_speed", "camera_control_origin", "latents", "input_image", "tiled", "tile_size", "tile_stride"),
+            input_params=("height", "width", "num_frames", "camera_control_direction", "camera_control_speed", "camera_control_origin", "latents", "input_image", "tiled", "tile_size", "tile_stride", "pose_file_path"),
             output_params=("control_camera_latents_input", "y"),
             onload_model_names=("vae",)
         )
 
-    def process(self, pipe: WanVideoPipeline, height, width, num_frames, camera_control_direction, camera_control_speed, camera_control_origin, latents, input_image, tiled, tile_size, tile_stride):
-        if camera_control_direction is None:
+    def process(self, pipe: WanVideoPipeline, height, width, num_frames, camera_control_direction, camera_control_speed, camera_control_origin, latents, input_image, tiled, tile_size, tile_stride, pose_file_path):
+        if camera_control_direction is None and pose_file_path is None:
             return {}
         pipe.load_models_to_device(self.onload_model_names)
         camera_control_plucker_embedding = pipe.dit.control_adapter.process_camera_coordinates(
-            camera_control_direction, num_frames, height, width, camera_control_speed, camera_control_origin)
+            camera_control_direction, num_frames, height, width, camera_control_speed, camera_control_origin, pose_file_path=pose_file_path)
         
         control_camera_video = camera_control_plucker_embedding[:num_frames].permute([3, 0, 1, 2]).unsqueeze(0)
         control_camera_latents = torch.concat(
@@ -965,7 +962,7 @@ class WanVideoUnit_AnimateInpaint(PipelineUnit):
             onload_model_names=("vae",)
         )
         
-    def get_i2v_mask(self, lat_t, lat_h, lat_w, mask_len=1, mask_pixel_values=None, device=get_device_type()):
+    def get_i2v_mask(self, lat_t, lat_h, lat_w, mask_len=1, mask_pixel_values=None, device="cuda"):
         if mask_pixel_values is None:
             msk = torch.zeros(1, (lat_t-1) * 4 + 1, lat_h, lat_w, device=device)
         else:
@@ -1255,8 +1252,11 @@ def model_fn_wan_video(
         context = torch.cat([clip_embdding, context], dim=1)
         
     # Camera control
+    # print('x before camera control ',x.shape)    #[1, 32, 21, 60, 104]
+    # #control camera latents input shape is
+    # print('control_camera_latents_input ', control_camera_latents_input.shape)  #[1, 24, 21, 60, 104]
     x = dit.patchify(x, control_camera_latents_input)
-    
+    # print('x after camera control ',x.shape) #[1, 1536, 21, 52, 30]
     # Animate
     if pose_latents is not None and face_pixel_values is not None:
         x, motion_vec = animate_adapter.after_patch_embedding(x, pose_latents, face_pixel_values)
@@ -1331,6 +1331,7 @@ def model_fn_wan_video(
                 return vap(block, *inputs)
             return custom_forward
         
+        # FW-TODO:在这里划分PCB和IRG，其中IRG在wan video dit中实现
         for block_id, block in enumerate(dit.blocks):
             # Block
             if vap is not None and block_id in vap.mot_layers_mapping:
@@ -1365,6 +1366,8 @@ def model_fn_wan_video(
                     )
                 else:
                     x = block(x, context, t_mod, freqs)
+            
+            
             
             # VACE
             if vace_context is not None and block_id in vace.vace_layers_mapping:
@@ -1485,7 +1488,9 @@ def model_fn_wans2v(
         def custom_forward(*inputs):
             return module(*inputs)
         return custom_forward
-
+    
+    # FW-TODO: 在这里实际完成PCB和IRG的划分，其中IRG在wan video dit中实现
+    # Fantasy World复现
     for block_id, block in enumerate(dit.blocks):
         if use_gradient_checkpointing_offload:
             with torch.autograd.graph.save_on_cpu():
