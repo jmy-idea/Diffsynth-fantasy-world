@@ -3,6 +3,7 @@ from diffsynth.core import UnifiedDataset
 from diffsynth.core.data.operators import LoadVideo, LoadAudio, ImageCropAndResize, ToAbsolutePath
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.diffusion import *
+from diffsynth.diffusion.loss import FantasyWorldLoss
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
@@ -51,6 +52,10 @@ class WanTrainingModule(DiffusionTrainingModule):
         self.extra_inputs = extra_inputs.split(",") if extra_inputs is not None else []
         self.fp8_models = fp8_models
         self.task = task
+        if self.task.startswith("fantasy_world"):
+            if hasattr(self.pipe.dit, "enable_fantasy_world_mode"):
+                self.pipe.dit.enable_fantasy_world_mode()
+
         self.task_to_loss = {
             "sft:data_process": lambda pipe, *args: args,
             "direct_distill:data_process": lambda pipe, *args: args,
@@ -58,6 +63,8 @@ class WanTrainingModule(DiffusionTrainingModule):
             "sft:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FlowMatchSFTLoss(pipe, **inputs_shared, **inputs_posi),
             "direct_distill": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
             "direct_distill:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
+            "fantasy_world": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FantasyWorldLoss(pipe, **inputs_shared, **inputs_posi),
+            "fantasy_world:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FantasyWorldLoss(pipe, **inputs_shared, **inputs_posi),
         }
         self.max_timestep_boundary = max_timestep_boundary
         self.min_timestep_boundary = min_timestep_boundary

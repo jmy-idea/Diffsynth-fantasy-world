@@ -1174,6 +1174,7 @@ def model_fn_wan_video(
             use_unified_sequence_parallel=use_unified_sequence_parallel,
             motion_bucket_id=motion_bucket_id,
         )
+        model_kwargs.update(kwargs)
         return TemporalTiler_BCTHW().run(
             model_fn_wan_video,
             sliding_window_size, sliding_window_stride,
@@ -1182,33 +1183,7 @@ def model_fn_wan_video(
             tensor_names=["latents", "y"],
             batch_size=2 if cfg_merge else 1
         )
-    # LongCat-Video
-    if isinstance(dit, LongCatVideoTransformer3DModel):
-        return model_fn_longcat_video(
-            dit=dit,
-            latents=latents,
-            timestep=timestep,
-            context=context,
-            longcat_latents=longcat_latents,
-            use_gradient_checkpointing=use_gradient_checkpointing,
-            use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
-        )
-        
-    # wan2.2 s2v
-    if audio_embeds is not None:
-        return model_fn_wans2v(
-            dit=dit,
-            latents=latents,
-            timestep=timestep,
-            context=context,
-            audio_embeds=audio_embeds,
-            motion_latents=motion_latents,
-            s2v_pose_latents=s2v_pose_latents,
-            drop_motion_frames=drop_motion_frames,
-            use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
-            use_gradient_checkpointing=use_gradient_checkpointing,
-            use_unified_sequence_parallel=use_unified_sequence_parallel,
-        )
+
 
     if use_unified_sequence_parallel:
         import torch.distributed as dist
@@ -1331,8 +1306,29 @@ def model_fn_wan_video(
                 return vap(block, *inputs)
             return custom_forward
         
-        # FW-TODO:在这里划分PCB和IRG，其中IRG在wan video dit中实现
+        # =============================================================================
+        # Fantasy World复现
+        # [Fantasy World] Init
+        enable_fw = hasattr(dit, 'enable_fantasy_world') and dit.enable_fantasy_world
+        pose_emb = None
+        geo_features = []
+        x_geo = None
+        if enable_fw:
+             pose_params = kwargs.get('pose_params', None)
+             if pose_params is not None and hasattr(dit, 'pose_enc'):
+                 pose_emb = dit.pose_enc(pose_params)
+
         for block_id, block in enumerate(dit.blocks):
+            # [Fantasy World] Camera Injection
+            if enable_fw and pose_emb is not None and hasattr(dit, 'camera_adapters') \
+               and block_id < len(dit.camera_adapters) and dit.camera_adapters[block_id] is not None:
+                beta = dit.camera_adapters[block_id](pose_emb)
+                if beta.ndim == 3 and beta.shape[1] == f:
+                    beta_exp = beta.unsqueeze(2).expand(beta.shape[0], beta.shape[1], h*w, beta.shape[2]).flatten(1, 2)
+                    x = x + beta_exp
+                else:
+                    x = x + beta
+
             # Block
             if vap is not None and block_id in vap.mot_layers_mapping:
                 if use_gradient_checkpointing_offload:
@@ -1367,8 +1363,34 @@ def model_fn_wan_video(
                 else:
                     x = block(x, context, t_mod, freqs)
             
-            
-            
+            # [Fantasy World] Geometry Branch
+            if enable_fw and block_id >= 12:
+                 idx = block_id - 12
+                 # Init geometry branch at first step
+                 if idx == 0:
+                      if hasattr(dit, 'geo_projector'):
+                           x_geo = dit.geo_projector(x)
+                      else:
+                           x_geo = x.clone()
+                 
+                 if x_geo is not None and hasattr(dit, 'geo_blocks') and hasattr(dit, 'irg_cross_attns'):
+                     if use_gradient_checkpointing:
+                         x_geo = torch.utils.checkpoint.checkpoint(
+                             create_custom_forward(dit.geo_blocks[idx]), 
+                             x_geo, context, t_mod, freqs, pose_emb, ### FW: Pass plucker/pose emb
+                             use_reentrant=False
+                         )
+                     else:
+                         x_geo = dit.geo_blocks[idx](x_geo, context, t_mod, freqs, pose_emb) # FW: Pass plucker/pose emb
+                     
+                     # Fusion
+                     x, x_geo = dit.irg_cross_attns[idx](x, x_geo)
+                     
+                     # Collect feature for DPT head
+                     # Layers: 12..29 (18 layers total in geo branch). indices 0..17
+                     if idx in [4, 8, 12, 17]:
+                         geo_features.append(x_geo)
+
             # VACE
             if vace_context is not None and block_id in vace.vace_layers_mapping:
                 current_vace_hint = vace_hints[vace.vace_layers_mapping[block_id]]
@@ -1380,6 +1402,17 @@ def model_fn_wan_video(
             # Animate
             if pose_latents is not None and face_pixel_values is not None:
                 x = animate_adapter.after_transformer_block(block_id, x, motion_vec)
+        
+        # [Fantasy World] DPT Head & Camera Head
+        if enable_fw: 
+             if len(geo_features) > 0 and hasattr(dit, 'dpt_head'):
+                 dit.last_dpt_output = dit.dpt_head(geo_features, h, w)
+             if x_geo is not None and hasattr(dit, 'camera_head'):
+                 # Pool x_geo for global camera prediction? 
+                 # Assuming Global Average Pooling over tokens
+                 # x_geo: [B, L, C]
+                 dit.last_camera_output = dit.camera_head(x_geo.mean(dim=1))
+
         if tea_cache is not None:
             tea_cache.store(x)
             
@@ -1393,138 +1426,4 @@ def model_fn_wan_video(
         x = x[:, reference_latents.shape[1]:]
         f -= 1
     x = dit.unpatchify(x, (f, h, w))
-    return x
-
-
-def model_fn_longcat_video(
-    dit: LongCatVideoTransformer3DModel,
-    latents: torch.Tensor = None,
-    timestep: torch.Tensor = None,
-    context: torch.Tensor = None,
-    longcat_latents: torch.Tensor = None,
-    use_gradient_checkpointing=False,
-    use_gradient_checkpointing_offload=False,
-):
-    if longcat_latents is not None:
-        latents[:, :, :longcat_latents.shape[2]] = longcat_latents
-        num_cond_latents = longcat_latents.shape[2]
-    else:
-        num_cond_latents = 0
-    context = context.unsqueeze(0)
-    encoder_attention_mask = torch.any(context != 0, dim=-1)[:, 0].to(torch.int64)
-    output = dit(
-        latents,
-        timestep,
-        context,
-        encoder_attention_mask,
-        num_cond_latents=num_cond_latents,
-        use_gradient_checkpointing=use_gradient_checkpointing,
-        use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
-    )
-    output = -output
-    output = output.to(latents.dtype)
-    return output
-
-
-def model_fn_wans2v(
-    dit,
-    latents,
-    timestep,
-    context,
-    audio_embeds,
-    motion_latents,
-    s2v_pose_latents,
-    drop_motion_frames=True,
-    use_gradient_checkpointing_offload=False,
-    use_gradient_checkpointing=False,
-    use_unified_sequence_parallel=False,
-):
-    if use_unified_sequence_parallel:
-        import torch.distributed as dist
-        from xfuser.core.distributed import (get_sequence_parallel_rank,
-                                            get_sequence_parallel_world_size,
-                                            get_sp_group)
-    origin_ref_latents = latents[:, :, 0:1]
-    x = latents[:, :, 1:]
-
-    # context embedding
-    context = dit.text_embedding(context)
-
-    # audio encode
-    audio_emb_global, merged_audio_emb = dit.cal_audio_emb(audio_embeds)
-
-    # x and s2v_pose_latents
-    s2v_pose_latents = torch.zeros_like(x) if s2v_pose_latents is None else s2v_pose_latents
-    x, (f, h, w) = dit.patchify(dit.patch_embedding(x) + dit.cond_encoder(s2v_pose_latents))
-    seq_len_x = seq_len_x_global = x.shape[1] # global used for unified sequence parallel
-
-    # reference image
-    ref_latents, (rf, rh, rw) = dit.patchify(dit.patch_embedding(origin_ref_latents))
-    grid_sizes = dit.get_grid_sizes((f, h, w), (rf, rh, rw))
-    x = torch.cat([x, ref_latents], dim=1)
-    # mask
-    mask = torch.cat([torch.zeros([1, seq_len_x]), torch.ones([1, ref_latents.shape[1]])], dim=1).to(torch.long).to(x.device)
-    # freqs
-    pre_compute_freqs = rope_precompute(x.detach().view(1, x.size(1), dit.num_heads, dit.dim // dit.num_heads), grid_sizes, dit.freqs, start=None)
-    # motion
-    x, pre_compute_freqs, mask = dit.inject_motion(x, pre_compute_freqs, mask, motion_latents, drop_motion_frames=drop_motion_frames, add_last_motion=2)
-
-    x = x + dit.trainable_cond_mask(mask).to(x.dtype)
-
-    # tmod
-    timestep = torch.cat([timestep, torch.zeros([1], dtype=timestep.dtype, device=timestep.device)])
-    t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep))
-    t_mod = dit.time_projection(t).unflatten(1, (6, dit.dim)).unsqueeze(2).transpose(0, 2)
-
-    if use_unified_sequence_parallel and dist.is_initialized() and dist.get_world_size() > 1:
-        world_size, sp_rank = get_sequence_parallel_world_size(), get_sequence_parallel_rank()
-        assert x.shape[1] % world_size == 0, f"the dimension after chunk must be divisible by world size, but got {x.shape[1]} and {get_sequence_parallel_world_size()}"
-        x = torch.chunk(x, world_size, dim=1)[sp_rank]
-        seg_idxs = [0] + list(torch.cumsum(torch.tensor([x.shape[1]] * world_size), dim=0).cpu().numpy())
-        seq_len_x_list = [min(max(0, seq_len_x - seg_idxs[i]), x.shape[1]) for i in range(len(seg_idxs)-1)]
-        seq_len_x = seq_len_x_list[sp_rank]
-
-    def create_custom_forward(module):
-        def custom_forward(*inputs):
-            return module(*inputs)
-        return custom_forward
-    
-    # FW-TODO: 在这里实际完成PCB和IRG的划分，其中IRG在wan video dit中实现
-    # Fantasy World复现
-    for block_id, block in enumerate(dit.blocks):
-        if use_gradient_checkpointing_offload:
-            with torch.autograd.graph.save_on_cpu():
-                x = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
-                    x, context, t_mod, seq_len_x, pre_compute_freqs[0],
-                    use_reentrant=False,
-                )
-                x = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(lambda x: dit.after_transformer_block(block_id, x, audio_emb_global, merged_audio_emb, seq_len_x)),
-                    x,
-                    use_reentrant=False,
-                )
-        elif use_gradient_checkpointing:
-            x = torch.utils.checkpoint.checkpoint(
-                create_custom_forward(block),
-                x, context, t_mod, seq_len_x, pre_compute_freqs[0],
-                use_reentrant=False,
-            )
-            x = torch.utils.checkpoint.checkpoint(
-                create_custom_forward(lambda x: dit.after_transformer_block(block_id, x, audio_emb_global, merged_audio_emb, seq_len_x)),
-                x,
-                use_reentrant=False,
-            )
-        else:
-            x = block(x, context, t_mod, seq_len_x, pre_compute_freqs[0])
-            x = dit.after_transformer_block(block_id, x, audio_emb_global, merged_audio_emb, seq_len_x_global, use_unified_sequence_parallel)
-
-    if use_unified_sequence_parallel and dist.is_initialized() and dist.get_world_size() > 1:
-        x = get_sp_group().all_gather(x, dim=1)
-
-    x = x[:, :seq_len_x_global]
-    x = dit.head(x, t[:-1])
-    x = dit.unpatchify(x, (f, h, w))
-    # make compatible with wan video
-    x = torch.cat([origin_ref_latents, x], dim=2)
     return x

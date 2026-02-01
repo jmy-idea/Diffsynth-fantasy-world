@@ -33,7 +33,7 @@ def DirectDistillLoss(pipe: BasePipeline, **inputs):
     return loss
 
 # =============================================================================
-# Fantasy World复现
+# [Fantasy World] Loss Implementation
 def FantasyWorldLoss(pipe: BasePipeline, **inputs):
     # 1. Video Diffusion Loss
     # We ensure 'pose_params' is in inputs for FW injection
@@ -48,26 +48,28 @@ def FantasyWorldLoss(pipe: BasePipeline, **inputs):
         pts_pred, pts_conf = pipe.dit.last_dpt_output
         pipe.dit.last_dpt_output = None # Clear
         
-        # pts_pred: [B, S, 3, H, W] (reshaped from [B*S])
-        # gt_points: [B, S, 3, H, W]
+        # pts_pred: [B, F, C=3, H, W]
+        # gt_points: [B, F, 3, H, W] or [B, S, ...] depending on input
         gt_points = inputs.get("gt_points", None)
         
         if gt_points is not None:
-            # Resize GT to match prediction resolution if necessary
+            # Check resolution matching
             if pts_pred.shape[-2:] != gt_points.shape[-2:]:
-                b, s, c, h, w = gt_points.shape
+                # Downsample GT or Upsample Pred? Usually Downsample GT to latents or Upsample Pred to pixels.
+                # VGGT typically supervises at 2x latent resolution (from DPT).
+                b, f, c, h, w = gt_points.shape
+                # Flatten B, F for interpolation
                 gt_points = torch.nn.functional.interpolate(
-                    gt_points.view(b*s, c, h, w), 
+                    gt_points.view(b*f, c, h, w), 
                     size=pts_pred.shape[-2:], 
                     mode='nearest'
-                ).view(b, s, c, *pts_pred.shape[-2:])
-            
-            # Mask valid points if needed (inputs['gt_valid_mask']?)
+                ).view(b, f, c, *pts_pred.shape[-2:])
             
             # Point Map Loss (L_pmap)
             # sum(|Conf * (P - G)| + |Conf * (GradP - GradG)| - gamma * log(Conf))
             gamma = 0.1
             
+            # Ensure proper broadcasting
             diff = (pts_pred - gt_points).abs()
             loss_pts = (pts_conf * diff).mean()
             
@@ -90,21 +92,45 @@ def FantasyWorldLoss(pipe: BasePipeline, **inputs):
             # Regularization
             loss_reg = -gamma * torch.log(pts_conf.clamp(min=1e-6)).mean()
             
-            loss_geo = loss_pts + loss_grad + loss_reg
-            
-        # Depth Loss (Optional, using Z channel or separate GT)
-        gt_depth = inputs.get("gt_depth", None)
-        if gt_depth is not None:
-             # Basic L1
-             # Assuming Z is depth-like
-             depth_pred = pts_pred[:, :, 2:3] 
-             if depth_pred.shape[-2:] != gt_depth.shape[-2:]:
-                  # Resize
-                  pass
-             # loss_depth = F.l1_loss(depth_pred, gt_depth)
-             # loss_geo += loss_depth
-             pass
+            loss_geo += loss_pts + loss_grad + loss_reg
 
+            # Depth Loss
+            gt_depth = inputs.get("gt_depth", None)
+            if gt_depth is not None:
+                # pts_pred: [B, F, C=3, H, W] => Z is dim 2
+                pred_depth = pts_pred[:, :, 2:3, :, :]
+                
+                if pred_depth.shape[-2:] != gt_depth.shape[-2:]:
+                    b_d, f_d, c_d, h_d, w_d = gt_depth.shape
+                    gt_depth = torch.nn.functional.interpolate(
+                        gt_depth.view(b_d*f_d, c_d, h_d, w_d),
+                        size=pred_depth.shape[-2:],
+                        mode='nearest'
+                    ).view(b_d, f_d, c_d, *pred_depth.shape[-2:])
+                
+                loss_depth = torch.nn.functional.l1_loss(pred_depth, gt_depth)
+                loss_geo += loss_depth
+        
+        # Camera Loss
+        # Retrieve camera head output
+        if hasattr(pipe.dit, 'last_camera_output') and pipe.dit.last_camera_output is not None:
+            pred_cam = pipe.dit.last_camera_output
+            pipe.dit.last_camera_output = None # Clear
+            
+            gt_cam = inputs.get("pose_params", None) # Assuming input params are GT
+            if gt_cam is not None:
+                # Ensure dims match
+                # pose_params might be (B, 9), pred_cam (B, 7) or (B, 6).
+                # User set output_dim=7 in wan_video_dit.py
+                # loss L2 or L1
+                if pred_cam.shape == gt_cam.shape:
+                    loss_cam = torch.nn.functional.mse_loss(pred_cam, gt_cam)
+                    loss_geo += 3.0 * loss_cam
+                elif gt_cam.shape[-1] > pred_cam.shape[-1]:
+                     # Slice GT if needed, e.g. if GT is 9D but we predict 7D (quat+trans)
+                     loss_cam = torch.nn.functional.mse_loss(pred_cam, gt_cam[:, :pred_cam.shape[-1]])
+                     loss_geo += 3.0 * loss_cam
+                    
     return loss_diffusion + loss_geo
 # =============================================================================
 

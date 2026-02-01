@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import copy
 from typing import Tuple, Optional
 from einops import rearrange
 from .wan_video_camera_controller import SimpleAdapter
@@ -230,33 +231,45 @@ class DiTBlock(nn.Module):
         x = self.gate(x, gate_mlp, self.ffn(input_x))
         return x
 
-# =============================================================================
-# Fantasy World复现
-class PoseEncoder(nn.Module):
-    def __init__(self, dim, input_dim=9):
+class MLP(torch.nn.Module):
+    def __init__(self, in_dim, out_dim, has_pos_emb=False):
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, dim),
-            nn.SiLU(),
-            nn.Linear(dim, dim)
+        self.proj = torch.nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, in_dim),
+            nn.GELU(),
+            nn.Linear(in_dim, out_dim),
+            nn.LayerNorm(out_dim)
         )
+        self.has_pos_emb = has_pos_emb
+        if has_pos_emb:
+            self.emb_pos = torch.nn.Parameter(torch.zeros((1, 514, 1280)))
 
     def forward(self, x):
-        return self.mlp(x)
+        if self.has_pos_emb:
+            x = x + self.emb_pos.to(dtype=x.dtype, device=x.device)
+        return self.proj(x)
 
-class MMBiCrossAttention(nn.Module):
-    def __init__(self, dim, num_heads):
+
+class Head(nn.Module):
+    def __init__(self, dim: int, out_dim: int, patch_size: Tuple[int, int, int], eps: float):
         super().__init__()
-        self.cross_attn_v2g = CrossAttention(dim, num_heads)
-        self.cross_attn_g2v = CrossAttention(dim, num_heads)
-        # Zero init
-        nn.init.zeros_(self.cross_attn_v2g.o.weight)
-        nn.init.zeros_(self.cross_attn_g2v.o.weight)
+        self.dim = dim
+        self.patch_size = patch_size
+        self.norm = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
+        self.head = nn.Linear(dim, out_dim * math.prod(patch_size))
+        self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
 
-    def forward(self, x_video, x_geo):
-        attn_v = self.cross_attn_v2g(x_video, x_geo)
-        attn_g = self.cross_attn_g2v(x_geo, x_video)
-        return x_video + attn_v, x_geo + attn_g
+    def forward(self, x, t_mod):
+        if len(t_mod.shape) == 3:
+            shift, scale = (self.modulation.unsqueeze(0).to(dtype=t_mod.dtype, device=t_mod.device) + t_mod.unsqueeze(2)).chunk(2, dim=2)
+            x = (self.head(self.norm(x) * (1 + scale.squeeze(2)) + shift.squeeze(2)))
+        else:
+            shift, scale = (self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(2, dim=1)
+            x = (self.head(self.norm(x) * (1 + scale) + shift))
+        return x
+    
+
 
 # --- DPT Head Utilities ---
 
@@ -407,42 +420,265 @@ class DPTHead(nn.Module):
         return self.output_conv(o)
 # ===========================================================================
 
-class MLP(torch.nn.Module):
-    def __init__(self, in_dim, out_dim, has_pos_emb=False):
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import List, Tuple, Optional
+import copy
+
+# --------------------------
+# Fantasy World Components
+# --------------------------
+
+def custom_interpolate(
+    x: torch.Tensor,
+    size: Tuple[int, int] = None,
+    scale_factor: float = None,
+    mode: str = "bilinear",
+    align_corners: bool = True,
+) -> torch.Tensor:
+    if size is None:
+        size = (int(x.shape[-2] * scale_factor), int(x.shape[-1] * scale_factor))
+
+    INT_MAX = 1610612736
+    input_elements = size[0] * size[1] * x.shape[0] * x.shape[1]
+
+    if input_elements > INT_MAX:
+        chunks = torch.chunk(x, chunks=(input_elements // INT_MAX) + 1, dim=0)
+        interpolated_chunks = [
+            nn.functional.interpolate(chunk, size=size, mode=mode, align_corners=align_corners) for chunk in chunks
+        ]
+        x = torch.cat(interpolated_chunks, dim=0)
+        return x.contiguous()
+    else:
+        return nn.functional.interpolate(x, size=size, mode=mode, align_corners=align_corners)
+
+class ResidualConvUnit(nn.Module):
+    def __init__(self, features, activation, bn, groups=1):
         super().__init__()
-        self.proj = torch.nn.Sequential(
-            nn.LayerNorm(in_dim),
-            nn.Linear(in_dim, in_dim),
-            nn.GELU(),
-            nn.Linear(in_dim, out_dim),
-            nn.LayerNorm(out_dim)
-        )
-        self.has_pos_emb = has_pos_emb
-        if has_pos_emb:
-            self.emb_pos = torch.nn.Parameter(torch.zeros((1, 514, 1280)))
+        self.bn = bn
+        self.groups = groups
+        self.conv1 = nn.Conv2d(features, features, kernel_size=3, stride=1, padding=1, bias=True, groups=self.groups)
+        self.conv2 = nn.Conv2d(features, features, kernel_size=3, stride=1, padding=1, bias=True, groups=self.groups)
+        self.activation = activation
+        self.skip_add = nn.quantized.FloatFunctional()
 
     def forward(self, x):
-        if self.has_pos_emb:
-            x = x + self.emb_pos.to(dtype=x.dtype, device=x.device)
-        return self.proj(x)
+        out = self.activation(x)
+        out = self.conv1(out)
+        out = self.activation(out)
+        out = self.conv2(out)
+        return self.skip_add.add(out, x)
 
-
-class Head(nn.Module):
-    def __init__(self, dim: int, out_dim: int, patch_size: Tuple[int, int, int], eps: float):
+class FeatureFusionBlock(nn.Module):
+    def __init__(self, features, activation, deconv=False, bn=False, expand=False, align_corners=True, size=None, has_residual=True, groups=1):
         super().__init__()
-        self.dim = dim
-        self.patch_size = patch_size
-        self.norm = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
-        self.head = nn.Linear(dim, out_dim * math.prod(patch_size))
-        self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
+        self.deconv = deconv
+        self.align_corners = align_corners
+        self.groups = groups
+        self.expand = expand
+        out_features = features
+        if self.expand == True:
+            out_features = features // 2
 
-    def forward(self, x, t_mod):
-        if len(t_mod.shape) == 3:
-            shift, scale = (self.modulation.unsqueeze(0).to(dtype=t_mod.dtype, device=t_mod.device) + t_mod.unsqueeze(2)).chunk(2, dim=2)
-            x = (self.head(self.norm(x) * (1 + scale.squeeze(2)) + shift.squeeze(2)))
+        self.out_conv = nn.Conv2d(features, out_features, kernel_size=1, stride=1, padding=0, bias=True, groups=self.groups)
+        if has_residual:
+            self.resConfUnit1 = ResidualConvUnit(features, activation, bn, groups=self.groups)
+        self.has_residual = has_residual
+        self.resConfUnit2 = ResidualConvUnit(features, activation, bn, groups=self.groups)
+        self.skip_add = nn.quantized.FloatFunctional()
+        self.size = size
+
+    def forward(self, *xs, size=None):
+        output = xs[0]
+        if self.has_residual:
+            res = self.resConfUnit1(xs[1])
+            output = self.skip_add.add(output, res)
+        output = self.resConfUnit2(output)
+        
+        if (size is None) and (self.size is None):
+            modifier = {"scale_factor": 2}
+        elif size is None:
+            modifier = {"size": self.size}
         else:
-            shift, scale = (self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(2, dim=1)
-            x = (self.head(self.norm(x) * (1 + scale) + shift))
+            modifier = {"size": size}
+            
+        output = custom_interpolate(output, **modifier, mode="bilinear", align_corners=self.align_corners)
+        output = self.out_conv(output)
+        return output
+
+def _make_scratch(in_shape: List[int], out_shape: int, groups: int = 1, expand: bool = False) -> nn.Module:
+    scratch = nn.Module()
+    out_shape1 = out_shape
+    out_shape2 = out_shape
+    out_shape3 = out_shape
+    out_shape4 = out_shape
+    if expand:
+        out_shape2 = out_shape * 2
+        out_shape3 = out_shape * 4
+        out_shape4 = out_shape * 8
+
+    scratch.layer1_rn = nn.Conv2d(in_shape[0], out_shape1, kernel_size=3, stride=1, padding=1, bias=False, groups=groups)
+    scratch.layer2_rn = nn.Conv2d(in_shape[1], out_shape2, kernel_size=3, stride=1, padding=1, bias=False, groups=groups)
+    scratch.layer3_rn = nn.Conv2d(in_shape[2], out_shape3, kernel_size=3, stride=1, padding=1, bias=False, groups=groups)
+    scratch.layer4_rn = nn.Conv2d(in_shape[3], out_shape4, kernel_size=3, stride=1, padding=1, bias=False, groups=groups)
+    return scratch
+
+def _make_fusion_block(features, use_bn=False, size=None, has_residual=True):
+    return FeatureFusionBlock(
+        features,
+        nn.ReLU(inplace=True),
+        deconv=False,
+        bn=use_bn,
+        expand=False,
+        align_corners=True,
+        size=size,
+        has_residual=has_residual,
+    )
+
+class DPTHead(nn.Module):
+    def __init__(self, dim_in: int, output_dim: int = 3, features: int = 256, out_channels: List[int] = [256, 512, 1024, 1024]):
+        super().__init__()
+        # Simplified DPTHead using only necessary parts
+        self.projects = nn.ModuleList([
+            nn.Conv2d(in_channels=dim_in, out_channels=oc, kernel_size=1, stride=1, padding=0) for oc in out_channels
+        ])
+        self.resize_layers = nn.ModuleList([
+            nn.ConvTranspose2d(out_channels[0], out_channels[0], kernel_size=4, stride=4, padding=0),
+            nn.ConvTranspose2d(out_channels[1], out_channels[1], kernel_size=2, stride=2, padding=0),
+            nn.Identity(),
+            nn.Conv2d(out_channels[3], out_channels[3], kernel_size=3, stride=2, padding=1),
+        ])
+        
+        self.scratch = _make_scratch(out_channels, features, expand=False)
+        self.scratch.refinenet1 = _make_fusion_block(features)
+        self.scratch.refinenet2 = _make_fusion_block(features)
+        self.scratch.refinenet3 = _make_fusion_block(features)
+        self.scratch.refinenet4 = _make_fusion_block(features, has_residual=False)
+        
+        head_features_1 = features
+        self.output_head = nn.Sequential(
+            nn.Conv2d(head_features_1, head_features_1 // 2, kernel_size=3, stride=1, padding=1),
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True),
+            nn.Conv2d(head_features_1 // 2, 32, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(True),
+            nn.Conv2d(32, output_dim, kernel_size=1, stride=1, padding=0),
+        )
+
+    def forward(self, features_list, h, w):
+        out = []
+        for feat in features_list:
+            b, l, c = feat.shape
+            f = l // (h*w)
+            feat = feat.view(b, f, h, w, c).permute(0, 1, 4, 2, 3).flatten(0, 1) # [B*F, C, h, w]
+            out.append(feat)
+        
+        layer_1, layer_2, layer_3, layer_4 = out
+        
+        layer_1_rn = self.scratch.layer1_rn(layer_1)
+        layer_2_rn = self.scratch.layer2_rn(layer_2)
+        layer_3_rn = self.scratch.layer3_rn(layer_3)
+        layer_4_rn = self.scratch.layer4_rn(layer_4)
+        
+        path_4 = self.scratch.refinenet4(layer_4_rn)
+        path_3 = self.scratch.refinenet3(path_4, layer_3_rn)
+        path_2 = self.scratch.refinenet2(path_3, layer_2_rn)
+        path_1 = self.scratch.refinenet1(path_2, layer_1_rn)
+        
+        out = self.output_head(path_1)
+        
+        # Activate Head
+        pts, conf = activate_head(out)
+        
+        # Reshape to [B, F, C, H, W]
+        pts = pts.view(b, f, -1, pts.shape[-2], pts.shape[-1])
+        conf = conf.view(b, f, -1, conf.shape[-2], conf.shape[-1])
+        
+        return pts, conf
+
+
+class PoseEncoder(nn.Module):
+    def __init__(self, in_dim=9, out_dim=2048):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, out_dim),
+            nn.SiLU(),
+            nn.Linear(out_dim, out_dim)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+class MMBiCrossAttention(nn.Module):
+    def __init__(self, dim, num_heads):
+        super().__init__()
+        # dim=2048, num_heads=16
+        # Use existing CrossAttention
+        self.attn1 = CrossAttention(dim, num_heads)
+        self.attn2 = CrossAttention(dim, num_heads)
+        # Gating
+        self.gate1 = nn.Parameter(torch.zeros(1))
+        self.gate2 = nn.Parameter(torch.zeros(1))
+        
+    def forward(self, x, x_geo):
+        # x: Video, x_geo: Geometry
+        # x_new = x + tanh(gate1) * CrossAttn(x, x_geo)
+        # x_geo_new = x_geo + tanh(gate2) * CrossAttn(x_geo, x)
+        
+        out1 = self.attn1(x, x_geo)
+        out2 = self.attn2(x_geo, x)
+        
+        x = x + torch.tanh(self.gate1) * out1
+        x_geo = x_geo + torch.tanh(self.gate2) * out2
+        
+        return x, x_geo
+
+
+class GeoDiTBlock(DiTBlock):
+    def __init__(self, original_block: DiTBlock, dim: int):
+        super().__init__(
+            has_image_input=original_block.cross_attn.has_image_input,
+            dim=original_block.dim,
+            num_heads=original_block.num_heads,
+            ffn_dim=original_block.ffn_dim,
+            eps=original_block.norm1.eps
+        )
+        self.load_state_dict(original_block.state_dict())
+        self.adapter = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim, dim)
+        )
+        # Freeze original params? controlled by enable_fantasy_world_mode loop.
+
+    def forward(self, x, context, t_mod, freqs, plucker_emb):
+        has_seq = len(t_mod.shape) == 4
+        chunk_dim = 2 if has_seq else 1
+        
+        # Original Modulation
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=chunk_dim)
+        if has_seq:
+             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                shift_msa.squeeze(2), scale_msa.squeeze(2), gate_msa.squeeze(2),
+                shift_mlp.squeeze(2), scale_mlp.squeeze(2), gate_mlp.squeeze(2),
+            )
+        
+        # Self Attn
+        input_x = modulate(self.norm1(x), shift_msa, scale_msa)
+        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
+        
+        # [Fantasy World] Inject Plucker Embedding
+        if plucker_emb is not None:
+             # Assume plucker_emb is [B, 1, C] or [B, C] -> broadcast
+             # Or if it represents spatial cues? usually standard adapter broadacast.
+             x = x + self.adapter(plucker_emb)
+
+        # Cross Attn
+        x = x + self.cross_attn(self.norm3(x), context)
+        
+        # FFN
+        input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
+        x = self.gate(x, gate_mlp, self.ffn(input_x))
         return x
 
 
@@ -513,6 +749,8 @@ class WanModel(torch.nn.Module):
         else:
             self.control_adapter = None
 
+        self.enable_fantasy_world = False
+
     def patchify(self, x: torch.Tensor, control_camera_latents_input: Optional[torch.Tensor] = None):
         x = self.patch_embedding(x)
         if self.control_adapter is not None and control_camera_latents_input is not None:
@@ -527,6 +765,53 @@ class WanModel(torch.nn.Module):
             f=grid_size[0], h=grid_size[1], w=grid_size[2], 
             x=self.patch_size[0], y=self.patch_size[1], z=self.patch_size[2]
         )
+
+    def enable_fantasy_world_mode(self, split_layer=12):
+        self.enable_fantasy_world = True
+        
+        # 1. Pose Encoder (for Plucker Embedding)
+        # Input: 9D? or 6D Plucker? User says "receive plucker embedding".
+        # If user provides plucker directly, maybe input dim matches that.
+        # Let's assume input_dim=6 for plucker, or we map params to it.
+        # Assuming we encode the embedding.
+        self.pose_enc = PoseEncoder(in_dim=9, out_dim=self.dim)
+        
+        # 2. Camera Head (for Loss)
+        self.camera_head = CameraHead(self.dim, output_dim=7)
+
+        # 3. Camera Adapters (Video Branch Injection)
+        self.camera_adapters = nn.ModuleList([
+            nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(self.dim, self.dim)
+            ) for _ in range(len(self.blocks))
+        ])
+        
+        # 4. Geometry Projector
+        self.geo_projector = nn.Linear(self.dim, self.dim)
+        
+        # 5. Geometry Blocks (GeoDiTBlock with Adapter)
+        self.geo_blocks = nn.ModuleList([
+            GeoDiTBlock(self.blocks[i], self.dim) 
+            for i in range(split_layer, len(self.blocks))
+        ])
+        
+        # 6. IRG Cross Attention
+        self.irg_cross_attns = nn.ModuleList([
+            MMBiCrossAttention(self.dim, self.blocks[0].num_heads) 
+            for _ in range(len(self.geo_blocks))
+        ])
+        
+        # 7. DPT Head
+        self.dpt_head = DPTHead(
+            dim_in=self.dim, 
+            out_channels=[256, 512, 1024, 1024], 
+            output_dim=4 
+        )
+        
+        for param in self.blocks.parameters():
+            param.requires_grad = False
+
 
     def forward(self,
                 x: torch.Tensor,
