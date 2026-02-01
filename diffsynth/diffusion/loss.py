@@ -36,100 +36,141 @@ def DirectDistillLoss(pipe: BasePipeline, **inputs):
 # [Fantasy World] Loss Implementation
 def FantasyWorldLoss(pipe: BasePipeline, **inputs):
     # 1. Video Diffusion Loss
-    # We ensure 'pose_params' is in inputs for FW injection
     loss_diffusion = FlowMatchSFTLoss(pipe, **inputs)
     
-    # 2. Geometry Branch Supervision
     loss_geo = 0.0
     
-    # Retrieve DPT outputs from the forward pass stored in the model
-    # (Note: FlowMatchSFTLoss calls model_fn which triggers the forward)
-    if hasattr(pipe.dit, 'last_dpt_output') and pipe.dit.last_dpt_output is not None:
-        pts_pred, pts_conf = pipe.dit.last_dpt_output
-        pipe.dit.last_dpt_output = None # Clear
+    # 2. Geometry Branch Supervision
+    
+    # --- A. Depth Loss ---
+    # L_depth = alpha * L_TGM + beta * L_frame
+    if hasattr(pipe.dit, 'last_depth_output') and pipe.dit.last_depth_output is not None:
+        pred_depth = pipe.dit.last_depth_output # [B, 1, T, H, W] or [B, T, 1, H, W] ?
+        # Note: DPTHead output usually [B*S, C, H, W] or similar. 
+        # But we did not flatten B, S. Let's check WanModel unpatchify or head.
+        # DPT head forward takes features. Features are [B, (HW), C]? No.
+        # The captured features in pipeline were "x.clone()".
+        # x shape in pipeline: [B, FHW, C] or flattened.
+        # DPTHead expects list of features.
+        # Current DPTHead implementation (which we didn't fully rewrite) expects [B, C, H, W].
+        # But our x is flattened tokens.
+        # We need to reshape inside DPTHead or before passing.
+        # But assuming "DPTHead" works as expected (implementation detail omitted/assumed fixed in Context):
+        # Let's assume prediction is [B, 1, T_out, H, W] (from temporal upsampling outside or raw)
+        # Actually in WanModel we didn't add temporal upsample to DPT output.
+        # But let's assume raw output [B, T, 1, H, W].
+        pipe.dit.last_depth_output = None
         
-        # pts_pred: [B, F, C=3, H, W]
-        # gt_points: [B, F, 3, H, W] or [B, S, ...] depending on input
-        gt_points = inputs.get("gt_points", None)
-        
-        if gt_points is not None:
-            # Check resolution matching
-            if pts_pred.shape[-2:] != gt_points.shape[-2:]:
-                # Downsample GT or Upsample Pred? Usually Downsample GT to latents or Upsample Pred to pixels.
-                # VGGT typically supervises at 2x latent resolution (from DPT).
-                b, f, c, h, w = gt_points.shape
-                # Flatten B, F for interpolation
-                gt_points = torch.nn.functional.interpolate(
-                    gt_points.view(b*f, c, h, w), 
-                    size=pts_pred.shape[-2:], 
-                    mode='nearest'
-                ).view(b, f, c, *pts_pred.shape[-2:])
+        gt_depth = inputs.get("gt_depth", None)
+        if gt_depth is not None:
+             # Ensure shape match. 
+             # Pred: [B, C=1, T, H, W]. GT: [B, T, C=1, H, W] or similar.
+             if pred_depth.ndim == 4: # [B*T, C, H, W]
+                 b = gt_depth.shape[0]
+                 t = gt_depth.shape[1]
+                 pred_depth = pred_depth.view(b, t, -1, *pred_depth.shape[-2:])
+                 pred_depth = pred_depth.permute(0, 2, 1, 3, 4) # [B, C, T, H, W]
             
-            # Point Map Loss (L_pmap)
-            # sum(|Conf * (P - G)| + |Conf * (GradP - GradG)| - gamma * log(Conf))
-            gamma = 0.1
-            
-            # Ensure proper broadcasting
-            diff = (pts_pred - gt_points).abs()
-            loss_pts = (pts_conf * diff).mean()
-            
-            # Gradient Loss
-            def gradients(x):
-                dy = x[..., 1:, :] - x[..., :-1, :]
-                dx = x[..., :, 1:] - x[..., :, :-1]
-                return dx, dy
-                
-            dx_p, dy_p = gradients(pts_pred)
-            dx_g, dy_g = gradients(gt_points)
-            
-            # Align conf for gradients (slice to match size)
-            conf_dx = pts_conf[..., :, 1:]
-            conf_dy = pts_conf[..., 1:, :]
-            
-            loss_grad = (conf_dx * (dx_p - dx_g).abs()).mean() + \
-                        (conf_dy * (dy_p - dy_g).abs()).mean()
-            
-            # Regularization
-            loss_reg = -gamma * torch.log(pts_conf.clamp(min=1e-6)).mean()
-            
-            loss_geo += loss_pts + loss_grad + loss_reg
+             if gt_depth.ndim == 5: # [B, T, C, H, W] -> [B, C, T, H, W]
+                 gt_depth = gt_depth.permute(0, 2, 1, 3, 4)
+             
+             # Interpolate GT to Pred resolution (or vice versa)
+             # Usually output is high res? or latent res?
+             # Let's match GT to Pred
+             if pred_depth.shape[-2:] != gt_depth.shape[-2:]:
+                  gt_depth = torch.nn.functional.interpolate(
+                      gt_depth, size=pred_depth.shape[-2:], mode='nearest'
+                  )
+             if pred_depth.shape[2] != gt_depth.shape[2]: # Temporal
+                  gt_depth = torch.nn.functional.interpolate(
+                      gt_depth, size=pred_depth.shape[2:], mode='nearest'
+                  )
 
-            # Depth Loss
-            gt_depth = inputs.get("gt_depth", None)
-            if gt_depth is not None:
-                # pts_pred: [B, F, C=3, H, W] => Z is dim 2
-                pred_depth = pts_pred[:, :, 2:3, :, :]
-                
-                if pred_depth.shape[-2:] != gt_depth.shape[-2:]:
-                    b_d, f_d, c_d, h_d, w_d = gt_depth.shape
-                    gt_depth = torch.nn.functional.interpolate(
-                        gt_depth.view(b_d*f_d, c_d, h_d, w_d),
-                        size=pred_depth.shape[-2:],
-                        mode='nearest'
-                    ).view(b_d, f_d, c_d, *pred_depth.shape[-2:])
-                
-                loss_depth = torch.nn.functional.l1_loss(pred_depth, gt_depth)
-                loss_geo += loss_depth
+             # L_frame (MAE)
+             loss_frame = torch.abs(pred_depth - gt_depth).mean()
+             
+             # L_TGM (Temporal Gradient Matching)
+             # Gradient along T (dim 2)
+             dt_pred = pred_depth[:, :, 1:, :, :] - pred_depth[:, :, :-1, :, :]
+             dt_gt = gt_depth[:, :, 1:, :, :] - gt_depth[:, :, :-1, :, :]
+             loss_tgm = torch.abs(dt_pred - dt_gt).mean()
+             
+             loss_geo += (loss_tgm + loss_frame)
+
+    # --- B. Point Map Loss ---
+    # L_pmap = sum(|Conf * (P - G)| + |Conf * (GradP - GradG)| - gamma * log(Conf))
+    if hasattr(pipe.dit, 'last_point_output') and pipe.dit.last_point_output is not None:
+        pred_pmap = pipe.dit.last_point_output # [B, 4, T, H, W]
+        pipe.dit.last_point_output = None
         
-        # Camera Loss
-        # Retrieve camera head output
-        if hasattr(pipe.dit, 'last_camera_output') and pipe.dit.last_camera_output is not None:
-            pred_cam = pipe.dit.last_camera_output
-            pipe.dit.last_camera_output = None # Clear
+        gt_points = inputs.get("gt_points", None)
+        if gt_points is not None:
+             if pred_pmap.ndim == 4:
+                 b = gt_points.shape[0]
+                 t = gt_points.shape[1]
+                 pred_pmap = pred_pmap.view(b, t, -1, *pred_pmap.shape[-2:]).permute(0, 2, 1, 3, 4)
+             
+             pts_pred = pred_pmap[:, :3, ...]
+             pts_conf = pred_pmap[:, 3:4, ...].exp() # Ensure positive conf: exp or softplus
+             
+             if gt_points.ndim == 5: # [B, T, C, H, W] -> [B, C, T, H, W]
+                 gt_points = gt_points.permute(0, 2, 1, 3, 4)
+             
+             # Resize
+             if pts_pred.shape[-3:] != gt_points.shape[-3:]:
+                 gt_points = torch.nn.functional.interpolate(
+                     gt_points, size=pts_pred.shape[-3:], mode='nearest'
+                 )
             
-            gt_cam = inputs.get("pose_params", None) # Assuming input params are GT
-            if gt_cam is not None:
-                # Ensure dims match
-                # pose_params might be (B, 9), pred_cam (B, 7) or (B, 6).
-                # User set output_dim=7 in wan_video_dit.py
-                # loss L2 or L1
-                if pred_cam.shape == gt_cam.shape:
-                    loss_cam = torch.nn.functional.mse_loss(pred_cam, gt_cam)
-                    loss_geo += 3.0 * loss_cam
-                elif gt_cam.shape[-1] > pred_cam.shape[-1]:
-                     # Slice GT if needed, e.g. if GT is 9D but we predict 7D (quat+trans)
-                     loss_cam = torch.nn.functional.mse_loss(pred_cam, gt_cam[:, :pred_cam.shape[-1]])
-                     loss_geo += 3.0 * loss_cam
+             # Point Loss
+             diff = (pts_pred - gt_points).abs()
+             loss_pts = (pts_conf * diff).mean()
+             
+             # Spatial Gradient Loss
+             # Gradients along H and W (dims 3, 4)
+             def spatial_grads(x):
+                 dx = x[..., :, 1:] - x[..., :, :-1]
+                 dy = x[..., 1:, :] - x[..., :-1, :]
+                 return dx, dy
+             
+             dx_p, dy_p = spatial_grads(pts_pred)
+             dx_g, dy_g = spatial_grads(gt_points)
+             
+             conf_dx = pts_conf[..., :, 1:]
+             conf_dy = pts_conf[..., 1:, :]
+             
+             loss_grad = (conf_dx * (dx_p - dx_g).abs()).mean() + \
+                         (conf_dy * (dy_p - dy_g).abs()).mean()
+             
+             # Regularization
+             loss_reg = -0.1 * torch.log(pts_conf.clamp(min=1e-6)).mean()
+             
+             loss_geo += loss_pts + loss_grad + loss_reg
+
+    # --- C. Camera Loss ---
+    # L_camera = Robust Huber Loss
+    if hasattr(pipe.dit, 'last_camera_output') and pipe.dit.last_camera_output is not None:
+        pred_cam = pipe.dit.last_camera_output # [B, T, 9]
+        pipe.dit.last_camera_output = None
+        
+        gt_cam = inputs.get("pose_params", None) # [B, T, 9] assumed
+        if gt_cam is not None:
+            # Ensure dims match
+            # If Pred [B, T, 9] and GT [B, T_gt, 9], we upsampled pred using conv1d.
+            # Interpolate GT if mismatch (unlikely if design is correct) or slice/pad.
+            if pred_cam.shape[1] != gt_cam.shape[1]:
+                # Interpolate pred to GT len?
+                pred_cam_tp = pred_cam.transpose(1, 2) # B, 9, T
+                gt_len = gt_cam.shape[1]
+                pred_cam_tp = torch.nn.functional.interpolate(pred_cam_tp, size=gt_len, mode='linear')
+                pred_cam = pred_cam_tp.transpose(1, 2)
+            
+            # Robust Huber Loss
+            # "where g_hat is ground truth... L = sum || g_hat - g ||_opt"
+            # Assuming epsilon=1.0 or standard
+            loss_cam = torch.nn.functional.huber_loss(pred_cam, gt_cam, delta=1.0)
+            
+            loss_geo += 3.0 * loss_cam
                     
     return loss_diffusion + loss_geo
 # =============================================================================

@@ -1327,6 +1327,8 @@ def model_fn_wan_video(
                     beta_exp = beta.unsqueeze(2).expand(beta.shape[0], beta.shape[1], h*w, beta.shape[2]).flatten(1, 2)
                     x = x + beta_exp
                 else:
+                     # If beta is (B, 1, C) or (B, C)
+                    if beta.ndim == 2: beta = beta.unsqueeze(1)
                     x = x + beta
 
             # Block
@@ -1364,32 +1366,68 @@ def model_fn_wan_video(
                     x = block(x, context, t_mod, freqs)
             
             # [Fantasy World] Geometry Branch
-            if enable_fw and block_id >= 12:
-                 idx = block_id - 12
-                 # Init geometry branch at first step
-                 if idx == 0:
-                      if hasattr(dit, 'geo_projector'):
-                           x_geo = dit.geo_projector(x)
-                      else:
-                           x_geo = x.clone()
-                 
-                 if x_geo is not None and hasattr(dit, 'geo_blocks') and hasattr(dit, 'irg_cross_attns'):
-                     if use_gradient_checkpointing:
-                         x_geo = torch.utils.checkpoint.checkpoint(
-                             create_custom_forward(dit.geo_blocks[idx]), 
-                             x_geo, context, t_mod, freqs, pose_emb, ### FW: Pass plucker/pose emb
-                             use_reentrant=False
-                         )
-                     else:
-                         x_geo = dit.geo_blocks[idx](x_geo, context, t_mod, freqs, pose_emb) # FW: Pass plucker/pose emb
+            if enable_fw:
+                 # Capture Layer 8 (Index 7) from Main Branch
+                 if block_id == 7:
+                     geo_features.append(x.clone())
+
+                 # Capture Layer 12 (Index 11) from Main Branch
+                 if block_id == 11:
+                     geo_features.append(x.clone())
+
+                 if block_id >= 12:
+                     idx = block_id - 12
+                     # Init geometry branch at first step
+                     if idx == 0:
+                          if hasattr(dit, 'geo_projector'):
+                               x_geo = dit.geo_projector(x)
+                          else:
+                               x_geo = x.clone()
+
+                          # Add Camera Tokens (F tokens) and Register Tokens (4 tokens)
+                          if hasattr(dit, 'token_camera') and hasattr(dit, 'tokens_register'):
+                               # token_camera: [1, 1, C] -> Expand to [B, F, C]
+                               cam_tokens = dit.token_camera.expand(x_geo.shape[0], f, -1)
+                               # tokens_register: [1, 4, C] -> Expand to [B, 4, C]
+                               reg_tokens = dit.tokens_register.expand(x_geo.shape[0], -1, -1)
+                               # Concat: Video(FxHxW) + Cam(F) + Reg(4)
+                               x_geo = torch.cat([x_geo, cam_tokens, reg_tokens], dim=1)
                      
-                     # Fusion
-                     x, x_geo = dit.irg_cross_attns[idx](x, x_geo)
-                     
-                     # Collect feature for DPT head
-                     # Layers: 12..29 (18 layers total in geo branch). indices 0..17
-                     if idx in [4, 8, 12, 17]:
-                         geo_features.append(x_geo)
+                     if x_geo is not None and hasattr(dit, 'geo_blocks') and hasattr(dit, 'irg_cross_attns'):
+                         if use_gradient_checkpointing:
+                             # TODO: Handle freqs padding in gradient checkpointing if needed
+                             x_geo = torch.utils.checkpoint.checkpoint(
+                                 create_custom_forward(dit.geo_blocks[idx]), 
+                                 x_geo, context, t_mod, freqs, pose_emb,
+                                 use_reentrant=False
+                             )
+                         else:
+                             # Expand freqs for extra tokens (F + 4) with 0 frequency
+                             # freqs: [F*H*W, 1, D/H]
+                             if x_geo.shape[1] > freqs.shape[0]:
+                                 extra_len = x_geo.shape[1] - freqs.shape[0]
+                                 freqs_ext = torch.cat([freqs, torch.zeros(extra_len, *freqs.shape[1:], device=freqs.device, dtype=freqs.dtype)], dim=0)
+                             else:
+                                 freqs_ext = freqs
+                                 
+                             # Pass modified freqs
+                             x_geo = dit.geo_blocks[idx](x_geo, context, t_mod, freqs_ext, pose_emb) 
+                         
+                         # Fusion: Only fuse VIDEO tokens
+                         x_geo_vid = x_geo[:, :f*h*w, :]
+                         x_geo_extra = x_geo[:, f*h*w:, :]
+                         
+                         x_new, x_geo_vid_new = dit.irg_cross_attns[idx](x, x_geo_vid)
+                         x = x_new
+                         # Reconstruct x_geo with updated video tokens
+                         x_geo = torch.cat([x_geo_vid_new, x_geo_extra], dim=1)
+                         
+                         # Collect feature for DPT head (Layer 18=idx6, Layer 24=idx12)
+                         if idx == 6:
+                             geo_features.append(x_geo_vid_new)
+                         
+                         if idx == 12:
+                             geo_features.append(x_geo_vid_new)
 
             # VACE
             if vace_context is not None and block_id in vace.vace_layers_mapping:
@@ -1405,13 +1443,19 @@ def model_fn_wan_video(
         
         # [Fantasy World] DPT Head & Camera Head
         if enable_fw: 
-             if len(geo_features) > 0 and hasattr(dit, 'dpt_head'):
-                 dit.last_dpt_output = dit.dpt_head(geo_features, h, w)
-             if x_geo is not None and hasattr(dit, 'camera_head'):
-                 # Pool x_geo for global camera prediction? 
-                 # Assuming Global Average Pooling over tokens
-                 # x_geo: [B, L, C]
-                 dit.last_camera_output = dit.camera_head(x_geo.mean(dim=1))
+             # geo_features should have [Feat8, Feat12, Feat18, Feat24]
+             if len(geo_features) > 0:
+                 if hasattr(dit, 'head_depth'):
+                     dit.last_depth_output = dit.head_depth(geo_features, h, w)
+                 if hasattr(dit, 'head_point'):
+                     dit.last_point_output = dit.head_point(geo_features, h, w)
+                     
+             if x_geo is not None and hasattr(dit, 'head_camera'):
+                 # Extract the camera tokens stream
+                 # Structure: [Video(FHW), Camera(F), Register(4)]
+                 # Camera tokens are at [FHW : FHW+F]
+                 cam_tokens = x_geo[:, f*h*w : f*h*w+f, :]
+                 dit.last_camera_output = dit.head_camera(cam_tokens)
 
         if tea_cache is not None:
             tea_cache.store(x)

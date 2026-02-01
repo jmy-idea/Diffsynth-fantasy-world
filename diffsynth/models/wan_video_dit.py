@@ -682,6 +682,33 @@ class GeoDiTBlock(DiTBlock):
         return x
 
 
+class CameraHead(nn.Module):
+    def __init__(self, in_dim, out_dim=9):
+        super().__init__()
+        # Lightweight 1D convolution for temporal upsampling and prediction
+        # We assume 4x upsampling to match T = (t-1)*4 + 1 approximately
+        self.conv_in = nn.Conv1d(in_dim, in_dim, kernel_size=3, padding=1)
+        self.act = nn.SiLU()
+        self.conv_out = nn.Conv1d(in_dim, out_dim, kernel_size=3, padding=1)
+        
+    def forward(self, x):
+        # x: [B, T_latent, C]
+        x = x.transpose(1, 2) # [B, C, T_latent]
+        
+        # Temporal Upsampling (approx 4x)
+        # We use interpolate linear
+        t_in = x.shape[-1]
+        t_out = (t_in - 1) * 4 + 1
+        x = torch.nn.functional.interpolate(x, size=t_out, mode='linear', align_corners=True)
+        
+        x = self.conv_in(x)
+        x = self.act(x)
+        x = self.conv_out(x)
+        
+        x = x.transpose(1, 2) # [B, T_out, 9]
+        return x
+
+
 class WanModel(torch.nn.Module):
     def __init__(
         self,
@@ -770,16 +797,33 @@ class WanModel(torch.nn.Module):
         self.enable_fantasy_world = True
         
         # 1. Pose Encoder (for Plucker Embedding)
-        # Input: 9D? or 6D Plucker? User says "receive plucker embedding".
-        # If user provides plucker directly, maybe input dim matches that.
-        # Let's assume input_dim=6 for plucker, or we map params to it.
-        # Assuming we encode the embedding.
         self.pose_enc = PoseEncoder(in_dim=9, out_dim=self.dim)
         
-        # 2. Camera Head (for Loss)
-        self.camera_head = CameraHead(self.dim, output_dim=7)
+        # 2. Tokens (Camera + Registers)
+        # "Concatenate one learned camera token and four register tokens"
+        self.token_camera = nn.Parameter(torch.randn(1, 1, self.dim))
+        self.tokens_register = nn.Parameter(torch.randn(1, 4, self.dim))
 
-        # 3. Camera Adapters (Video Branch Injection)
+        # 3. Heads
+        # Camera Head
+        self.head_camera = CameraHead(self.dim, out_dim=9)
+        
+        # Depth Head (D = 1 channel)
+        # Using 3D DPT Head equivalent (spatial DPT + temporal handling in output)
+        self.head_depth = DPTHead(
+            dim_in=self.dim, 
+            out_channels=[256, 512, 1024, 1024], 
+            output_dim=1
+        )
+        
+        # Point Map Head (P = 3 channels + 1 confidence)
+        self.head_point = DPTHead(
+            dim_in=self.dim, 
+            out_channels=[256, 512, 1024, 1024], 
+            output_dim=4
+        )
+
+        # 4. Camera Adapters (Video Branch Injection)
         self.camera_adapters = nn.ModuleList([
             nn.Sequential(
                 nn.SiLU(),
@@ -787,27 +831,20 @@ class WanModel(torch.nn.Module):
             ) for _ in range(len(self.blocks))
         ])
         
-        # 4. Geometry Projector
+        # 5. Geometry Projector
         self.geo_projector = nn.Linear(self.dim, self.dim)
         
-        # 5. Geometry Blocks (GeoDiTBlock with Adapter)
+        # 6. Geometry Blocks
         self.geo_blocks = nn.ModuleList([
             GeoDiTBlock(self.blocks[i], self.dim) 
             for i in range(split_layer, len(self.blocks))
         ])
         
-        # 6. IRG Cross Attention
+        # 7. IRG Cross Attention
         self.irg_cross_attns = nn.ModuleList([
             MMBiCrossAttention(self.dim, self.blocks[0].num_heads) 
             for _ in range(len(self.geo_blocks))
         ])
-        
-        # 7. DPT Head
-        self.dpt_head = DPTHead(
-            dim_in=self.dim, 
-            out_channels=[256, 512, 1024, 1024], 
-            output_dim=4 
-        )
         
         for param in self.blocks.parameters():
             param.requires_grad = False
