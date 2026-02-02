@@ -538,43 +538,106 @@ def _make_fusion_block(features, use_bn=False, size=None, has_residual=True):
         has_residual=has_residual,
     )
 
-class DPTHead(nn.Module):
-    def __init__(self, dim_in: int, output_dim: int = 3, features: int = 256, out_channels: List[int] = [256, 512, 1024, 1024]):
+class TemporalUpsampleBlock(nn.Module):
+    """Temporal upsampling block inspired by WanVAE decoder.
+    Doubles temporal resolution then applies causal 3D conv.
+    """
+    def __init__(self, channels: int):
         super().__init__()
-        # Simplified DPTHead using only necessary parts
+        self.conv = nn.Conv3d(channels, channels, kernel_size=(3, 3, 3), padding=(1, 1, 1))
+        self.act = nn.SiLU()
+        
+    def forward(self, x):
+        # x: [B, C, T, H, W]
+        # Temporal upsample 2x
+        x = nn.functional.interpolate(x, scale_factor=(2, 1, 1), mode='trilinear', align_corners=True)
+        x = self.conv(x)
+        x = self.act(x)
+        return x
+
+
+class DPTHead3D(nn.Module):
+    """3D DPT Head with inverted reassemble logic and temporal upsampling.
+    
+    Key differences from standard DPT:
+    1. Inverted spatial reassemble: deeper layers (with better denoised features) 
+       are upsampled MORE, shallower layers are downsampled.
+    2. Temporal Blocks: 2 sequential TemporalUpsampleBlocks for 4x temporal upsampling.
+    
+    Features from IRG blocks {6,9,12,18} (for 18 layers) are processed as:
+    - Layer 6 (shallowest): downsample 2x spatially
+    - Layer 9: identity
+    - Layer 12: upsample 2x spatially  
+    - Layer 18 (deepest): upsample 4x spatially (best features, most upsampling)
+    """
+    def __init__(self, dim_in: int, output_dim: int = 3, features: int = 256, 
+                 out_channels: List[int] = [256, 512, 1024, 1024]):
+        super().__init__()
+        self.output_dim = output_dim
+        
+        # Project from transformer dim to different channel sizes
         self.projects = nn.ModuleList([
-            nn.Conv2d(in_channels=dim_in, out_channels=oc, kernel_size=1, stride=1, padding=0) for oc in out_channels
-        ])
-        self.resize_layers = nn.ModuleList([
-            nn.ConvTranspose2d(out_channels[0], out_channels[0], kernel_size=4, stride=4, padding=0),
-            nn.ConvTranspose2d(out_channels[1], out_channels[1], kernel_size=2, stride=2, padding=0),
-            nn.Identity(),
-            nn.Conv2d(out_channels[3], out_channels[3], kernel_size=3, stride=2, padding=1),
+            nn.Conv2d(in_channels=dim_in, out_channels=oc, kernel_size=1, stride=1, padding=0) 
+            for oc in out_channels
         ])
         
+        # INVERTED resize layers: deeper features get MORE upsampling
+        # Layer order: [shallow, ..., deep] -> [downsample, identity, upsample, upsample_more]
+        self.resize_layers = nn.ModuleList([
+            nn.Conv2d(out_channels[0], out_channels[0], kernel_size=3, stride=2, padding=1),  # shallow: downsample 2x
+            nn.Identity(),  # mid-shallow: identity
+            nn.ConvTranspose2d(out_channels[2], out_channels[2], kernel_size=2, stride=2, padding=0),  # mid-deep: upsample 2x
+            nn.ConvTranspose2d(out_channels[3], out_channels[3], kernel_size=4, stride=4, padding=0),  # deepest: upsample 4x
+        ])
+        
+        # RefineNet fusion blocks
         self.scratch = _make_scratch(out_channels, features, expand=False)
         self.scratch.refinenet1 = _make_fusion_block(features)
         self.scratch.refinenet2 = _make_fusion_block(features)
         self.scratch.refinenet3 = _make_fusion_block(features)
         self.scratch.refinenet4 = _make_fusion_block(features, has_residual=False)
         
-        head_features_1 = features
+        # Spatial output head
         self.output_head = nn.Sequential(
-            nn.Conv2d(head_features_1, head_features_1 // 2, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(features, features // 2, kernel_size=3, stride=1, padding=1),
             nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True),
-            nn.Conv2d(head_features_1 // 2, 32, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(features // 2, 32, kernel_size=3, stride=1, padding=1),
             nn.ReLU(True),
             nn.Conv2d(32, output_dim, kernel_size=1, stride=1, padding=0),
         )
+        
+        # Temporal upsampling blocks: 2 blocks for 4x temporal upsampling
+        # T_out = (T_in - 1) * 4 + 1
+        self.temporal_block1 = TemporalUpsampleBlock(output_dim)
+        self.temporal_block2 = TemporalUpsampleBlock(output_dim)
 
     def forward(self, features_list, h, w):
+        """
+        Args:
+            features_list: List of 4 features from IRG blocks, each [B, F*H*W, C]
+            h, w: spatial dimensions after patchify
+        Returns:
+            For depth head (output_dim=1): depth [B, T, 1, H_out, W_out]
+            For point head (output_dim=4): pts [B, T, 3, H, W], conf [B, T, 1, H, W]
+        """
+        if len(features_list) != 4:
+            raise ValueError(f"Expected 4 features, got {len(features_list)}")
+            
         out = []
-        for feat in features_list:
-            b, l, c = feat.shape
-            f = l // (h*w)
-            feat = feat.view(b, f, h, w, c).permute(0, 1, 4, 2, 3).flatten(0, 1) # [B*F, C, h, w]
+        b = features_list[0].shape[0]
+        
+        for i, feat in enumerate(features_list):
+            _, l, c = feat.shape
+            f = l // (h * w)
+            # Reshape to [B*F, C, h, w] for 2D conv processing
+            feat = feat.view(b, f, h, w, c).permute(0, 1, 4, 2, 3).flatten(0, 1)
+            # Project channels
+            feat = self.projects[i](feat)
+            # Apply inverted resize
+            feat = self.resize_layers[i](feat)
             out.append(feat)
         
+        # RefineNet fusion (from deep to shallow)
         layer_1, layer_2, layer_3, layer_4 = out
         
         layer_1_rn = self.scratch.layer1_rn(layer_1)
@@ -582,21 +645,49 @@ class DPTHead(nn.Module):
         layer_3_rn = self.scratch.layer3_rn(layer_3)
         layer_4_rn = self.scratch.layer4_rn(layer_4)
         
+        # Fusion from deepest to shallowest
         path_4 = self.scratch.refinenet4(layer_4_rn)
         path_3 = self.scratch.refinenet3(path_4, layer_3_rn)
         path_2 = self.scratch.refinenet2(path_3, layer_2_rn)
         path_1 = self.scratch.refinenet1(path_2, layer_1_rn)
         
-        out = self.output_head(path_1)
+        # Spatial output
+        spatial_out = self.output_head(path_1)  # [B*F, output_dim, H_out, W_out]
         
-        # Activate Head
-        pts, conf = activate_head(out)
+        # Reshape for temporal processing
+        _, c_out, h_out, w_out = spatial_out.shape
+        spatial_out = spatial_out.view(b, f, c_out, h_out, w_out)  # [B, F, C, H, W]
+        spatial_out = spatial_out.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
         
-        # Reshape to [B, F, C, H, W]
-        pts = pts.view(b, f, -1, pts.shape[-2], pts.shape[-1])
-        conf = conf.view(b, f, -1, conf.shape[-2], conf.shape[-1])
+        # Temporal upsampling: 4x (from F frames to T = (F-1)*4+1 frames)
+        temporal_out = self.temporal_block1(spatial_out)
+        temporal_out = self.temporal_block2(temporal_out)
+        # Trim to exact target length: T = (F-1)*4 + 1
+        t_target = (f - 1) * 4 + 1
+        temporal_out = temporal_out[:, :, :t_target, :, :]  # [B, C, T, H, W]
         
-        return pts, conf
+        # Permute to [B, T, C, H, W]
+        temporal_out = temporal_out.permute(0, 2, 1, 3, 4)
+        
+        if self.output_dim == 1:
+            # Depth output: [B, T, 1, H, W]
+            return temporal_out
+        else:
+            # Point map output: apply activation and split pts/conf
+            # temporal_out: [B, T, 4, H, W] -> need to process as [B*T, 4, H, W]
+            b_t = temporal_out.shape[0]
+            t_out = temporal_out.shape[1]
+            # Reshape to [B*T, C, H, W] for activate_head
+            flat_out = temporal_out.flatten(0, 1)  # [B*T, 4, H, W]
+            pts, conf = activate_head(flat_out)  # pts: [B*T, 3, H, W], conf: [B*T, 1, H, W]
+            # Reshape back to [B, T, C, H, W]
+            pts = pts.view(b_t, t_out, 3, h_out, w_out)
+            conf = conf.view(b_t, t_out, 1, h_out, w_out)
+            return pts, conf
+
+
+# Keep old name for compatibility
+DPTHead = DPTHead3D
 
 
 class PoseEncoder(nn.Module):
@@ -813,8 +904,10 @@ class WanModel(torch.nn.Module):
         
         # 2. Tokens (Camera + Registers)
         # "Concatenate one learned camera token and four register tokens"
-        self.token_camera = nn.Parameter(torch.randn(1, 1, self.dim))
-        self.tokens_register = nn.Parameter(torch.randn(1, 4, self.dim))
+        # Note: Camera token is a SINGLE token per video (not per frame)
+        # The CameraHead will temporally upsample to get per-frame predictions
+        self.token_camera = nn.Parameter(torch.randn(1, 1, self.dim) * 0.02)
+        self.tokens_register = nn.Parameter(torch.randn(1, 4, self.dim) * 0.02)
 
         # 3. Heads
         # Camera Head
@@ -834,11 +927,15 @@ class WanModel(torch.nn.Module):
         )
 
         # 4. Camera Adapters (Video Branch Injection)
+        # Paper: "applied to the first 24 of 40 blocks" -> for 30 blocks, apply to first split_layer blocks
+        # These adapters predict only the SHIFT beta_i (not full AdaLN with scale+shift)
+        # Injection: f_i = f_{i-1} + beta_i
         self.camera_adapters = nn.ModuleList([
             nn.Sequential(
                 nn.SiLU(),
                 nn.Linear(self.dim, self.dim)
-            ) for _ in range(len(self.blocks))
+            ) if i < split_layer else None
+            for i in range(len(self.blocks))
         ])
         
         # 5. Geometry Projector

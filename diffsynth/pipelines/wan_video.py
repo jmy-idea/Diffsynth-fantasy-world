@@ -1377,14 +1377,16 @@ def model_fn_wan_video(
                           else:
                                x_geo = x.clone()
 
-                          # Add Camera Tokens (F tokens) and Register Tokens (4 tokens)
+                          # Add Camera Token (1 token) and Register Tokens (4 tokens)
+                          # Paper: "concatenate one learned camera token and four register tokens"
+                          # Note: Camera token is SINGLE per video, CameraHead will temporally upsample
                           if hasattr(dit, 'token_camera') and hasattr(dit, 'tokens_register'):
-                               # token_camera: [1, 1, C] -> Expand to [B, F, C]
-                               cam_tokens = dit.token_camera.expand(x_geo.shape[0], f, -1)
+                               # token_camera: [1, 1, C] -> Expand to [B, 1, C]
+                               cam_token = dit.token_camera.expand(x_geo.shape[0], -1, -1)
                                # tokens_register: [1, 4, C] -> Expand to [B, 4, C]
                                reg_tokens = dit.tokens_register.expand(x_geo.shape[0], -1, -1)
-                               # Concat: Video(FxHxW) + Cam(F) + Reg(4)
-                               x_geo = torch.cat([x_geo, cam_tokens, reg_tokens], dim=1)
+                               # Concat: Video(FxHxW) + Cam(1) + Reg(4) = Video + 5 extra tokens
+                               x_geo = torch.cat([x_geo, cam_token, reg_tokens], dim=1)
                      
                      if x_geo is not None and hasattr(dit, 'geo_blocks') and hasattr(dit, 'irg_cross_attns'):
                          if use_gradient_checkpointing:
@@ -1395,7 +1397,7 @@ def model_fn_wan_video(
                                  use_reentrant=False
                              )
                          else:
-                             # Expand freqs for extra tokens (F + 4) with 0 frequency
+                             # Expand freqs for extra tokens (1 + 4 = 5) with 0 frequency
                              # freqs: [F*H*W, 1, D/H]
                              if x_geo.shape[1] > freqs.shape[0]:
                                  extra_len = x_geo.shape[1] - freqs.shape[0]
@@ -1408,7 +1410,7 @@ def model_fn_wan_video(
                          
                          # Fusion: Only fuse VIDEO tokens
                          x_geo_vid = x_geo[:, :f*h*w, :]
-                         x_geo_extra = x_geo[:, f*h*w:, :]
+                         x_geo_extra = x_geo[:, f*h*w:, :]  # [B, 5, C] = cam(1) + reg(4)
                          
                          x_new, x_geo_vid_new = dit.irg_cross_attns[idx](x, x_geo_vid)
                          x = x_new
@@ -1434,19 +1436,28 @@ def model_fn_wan_video(
         
         # [Fantasy World] DPT Head & Camera Head
         if enable_fw: 
-             # geo_features should have [Feat8, Feat12, Feat18, Feat24]
-             if len(geo_features) > 0:
+             # geo_features should have 4 features from IRG blocks
+             if len(geo_features) == 4:
                  if hasattr(dit, 'head_depth'):
                      dit.last_depth_output = dit.head_depth(geo_features, h, w)
                  if hasattr(dit, 'head_point'):
                      dit.last_point_output = dit.head_point(geo_features, h, w)
+             elif len(geo_features) > 0:
+                 print(f"Warning: Expected 4 geo_features, got {len(geo_features)}")
                      
              if x_geo is not None and hasattr(dit, 'head_camera'):
-                 # Extract the camera tokens stream
-                 # Structure: [Video(FHW), Camera(F), Register(4)]
-                 # Camera tokens are at [FHW : FHW+F]
-                 cam_tokens = x_geo[:, f*h*w : f*h*w+f, :]
-                 dit.last_camera_output = dit.head_camera(cam_tokens)
+                 # Extract the camera token (single token at position FHW)
+                 # Structure: [Video(FHW), Cam(1), Reg(4)]
+                 # Camera token is at index FHW (single token)
+                 cam_token = x_geo[:, f*h*w : f*h*w+1, :]  # [B, 1, C]
+                 # CameraHead expects [B, T_latent, C], uses temporal features
+                 # For single token, we need to use video features for temporal info
+                 # Alternative: use all F tokens from video for camera prediction
+                 # Paper says: "apply a lightweight 1D convolution to the camera token stream"
+                 # But we only have 1 camera token. Let's reshape video tokens for temporal dim
+                 # Use video features reshaped to [B, F, H*W, C] -> mean over spatial -> [B, F, C]
+                 video_tokens = x_geo_vid_new.view(x_geo.shape[0], f, h*w, -1).mean(dim=2)  # [B, F, C]
+                 dit.last_camera_output = dit.head_camera(video_tokens)
 
         if tea_cache is not None:
             tea_cache.store(x)
