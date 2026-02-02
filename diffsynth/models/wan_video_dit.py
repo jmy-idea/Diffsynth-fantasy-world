@@ -796,6 +796,17 @@ class WanModel(torch.nn.Module):
 
     def enable_fantasy_world_mode(self, split_layer=12):
         self.enable_fantasy_world = True
+        self.split_layer = split_layer
+        
+        # Define feature extraction layers within IRG blocks (relative indices)
+        # For 18 IRG blocks: layer 6, 9, 12, 18 (indices 5, 8, 11, 17)
+        num_geo_layers = len(self.blocks) - split_layer
+        self.geo_feature_indices = [
+            int(num_geo_layers * 0.33) - 1,  # ~6th layer (index 5)
+            int(num_geo_layers * 0.5) - 1,   # ~9th layer (index 8)
+            int(num_geo_layers * 0.67) - 1,  # ~12th layer (index 11)
+            num_geo_layers - 1                # last layer (index 17 for 18 layers)
+        ]
         
         # 1. Pose Encoder (for Plucker Embedding)
         self.pose_enc = PoseEncoder(in_dim=9, out_dim=self.dim)
@@ -813,14 +824,12 @@ class WanModel(torch.nn.Module):
         # Using 3D DPT Head equivalent (spatial DPT + temporal handling in output)
         self.head_depth = DPTHead(
             dim_in=self.dim, 
-            out_channels=[256, 512, 1024, 1024], 
             output_dim=1
         )
         
         # Point Map Head (P = 3 channels + 1 confidence)
         self.head_point = DPTHead(
             dim_in=self.dim, 
-            out_channels=[256, 512, 1024, 1024], 
             output_dim=4
         )
 

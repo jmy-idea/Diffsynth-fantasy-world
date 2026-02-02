@@ -1367,16 +1367,9 @@ def model_fn_wan_video(
             
             # [Fantasy World] Geometry Branch
             if enable_fw:
-                 # Capture Layer 8 (Index 7) from Main Branch
-                 if block_id == 7:
-                     geo_features.append(x.clone())
-
-                 # Capture Layer 12 (Index 11) from Main Branch
-                 if block_id == 11:
-                     geo_features.append(x.clone())
-
-                 if block_id >= 12:
-                     idx = block_id - 12
+                 # Only collect features from IRG blocks at split_layer
+                 if block_id >= dit.split_layer:
+                     idx = block_id - dit.split_layer
                      # Init geometry branch at first step
                      if idx == 0:
                           if hasattr(dit, 'geo_projector'):
@@ -1422,11 +1415,9 @@ def model_fn_wan_video(
                          # Reconstruct x_geo with updated video tokens
                          x_geo = torch.cat([x_geo_vid_new, x_geo_extra], dim=1)
                          
-                         # Collect feature for DPT head (Layer 18=idx6, Layer 24=idx12)
-                         if idx == 6:
-                             geo_features.append(x_geo_vid_new)
-                         
-                         if idx == 12:
+                         # Collect features at specified indices within IRG blocks
+                         # For 18 IRG blocks: indices 5, 8, 11, 17 (6th, 9th, 12th, 18th layers)
+                         if hasattr(dit, 'geo_feature_indices') and idx in dit.geo_feature_indices:
                              geo_features.append(x_geo_vid_new)
 
             # VACE
