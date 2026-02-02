@@ -493,11 +493,23 @@ class FeatureFusionBlock(nn.Module):
 
     def forward(self, *xs, size=None):
         output = xs[0]
-        if self.has_residual:
+        
+        # If there's a residual input (xs[1]), ensure spatial size matches before adding
+        if self.has_residual and len(xs) > 1:
             res = self.resConfUnit1(xs[1])
+            # Resize output to match res size if needed
+            if output.shape[-2:] != res.shape[-2:]:
+                output = custom_interpolate(
+                    output, 
+                    size=res.shape[-2:], 
+                    mode="bilinear", 
+                    align_corners=self.align_corners
+                )
             output = self.skip_add.add(output, res)
+        
         output = self.resConfUnit2(output)
         
+        # Apply final upsampling
         if (size is None) and (self.size is None):
             modifier = {"scale_factor": 2}
         elif size is None:
@@ -645,11 +657,29 @@ class DPTHead3D(nn.Module):
         layer_3_rn = self.scratch.layer3_rn(layer_3)
         layer_4_rn = self.scratch.layer4_rn(layer_4)
         
+        # Get spatial dimensions of each layer
+        # After resize operations, they should be:
+        # layer_1: downsampled 2x (smallest)
+        # layer_2: identity (original)
+        # layer_3: upsampled 2x
+        # layer_4: upsampled 4x (largest)
+        
         # Fusion from deepest to shallowest
+        # refinenet4: no residual, just process layer_4
         path_4 = self.scratch.refinenet4(layer_4_rn)
-        path_3 = self.scratch.refinenet3(path_4, layer_3_rn)
-        path_2 = self.scratch.refinenet2(path_3, layer_2_rn)
-        path_1 = self.scratch.refinenet1(path_2, layer_1_rn)
+        
+        # refinenet3: fuse path_4 with layer_3
+        # Need to ensure path_4 is resized to match layer_3's size
+        _, _, h3, w3 = layer_3_rn.shape
+        path_3 = self.scratch.refinenet3(path_4, layer_3_rn, size=(h3, w3))
+        
+        # refinenet2: fuse path_3 with layer_2
+        _, _, h2, w2 = layer_2_rn.shape
+        path_2 = self.scratch.refinenet2(path_3, layer_2_rn, size=(h2, w2))
+        
+        # refinenet1: fuse path_2 with layer_1
+        _, _, h1, w1 = layer_1_rn.shape
+        path_1 = self.scratch.refinenet1(path_2, layer_1_rn, size=(h1, w1))
         
         # Spatial output
         spatial_out = self.output_head(path_1)  # [B*F, output_dim, H_out, W_out]
@@ -688,6 +718,58 @@ class DPTHead3D(nn.Module):
 
 # Keep old name for compatibility
 DPTHead = DPTHead3D
+
+
+class LatentBridgeAdapter(nn.Module):
+    """Lightweight transformer adapter for Latent Bridging.
+    
+    Stage 1 in Fantasy World: Maps video branch features to geometry-aligned latent space.
+    - Input: Hidden features from block 16 of Wan2.1 [B, L, D]
+    - Output: Geometry-aligned latent [B, L, D]
+    
+    Architecture:
+    - Self-attention on video features (to refine/aggregate)
+    - Feed-forward network
+    - Layer normalization (pre-norm)
+    """
+    def __init__(self, dim: int, num_heads: int = 8, ffn_dim: int = 2048, num_layers: int = 2):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        
+        # Multi-head self-attention layers
+        self.layers = nn.ModuleList()
+        for _ in range(num_layers):
+            layer = nn.ModuleDict({
+                'norm1': nn.LayerNorm(dim),
+                'attn': SelfAttention(dim, num_heads),
+                'norm2': nn.LayerNorm(dim),
+                'ffn': nn.Sequential(
+                    nn.Linear(dim, ffn_dim),
+                    nn.GELU(approximate='tanh'),
+                    nn.Linear(ffn_dim, dim)
+                )
+            })
+            self.layers.append(layer)
+    
+    def forward(self, x):
+        """
+        Args:
+            x: [B, L, D] - hidden features from block 16
+        Returns:
+            out: [B, L, D] - geometry-aligned latent
+        """
+        for layer in self.layers:
+            # Pre-norm self-attention
+            x_norm = layer['norm1'](x)
+            x = x + layer['attn'](x_norm, None)  # SelfAttention takes (x, freqs) but we use None
+            
+            # Pre-norm FFN
+            x_norm = layer['norm2'](x)
+            x = x + layer['ffn'](x_norm)
+        
+        return x
 
 
 class PoseEncoder(nn.Module):
@@ -885,9 +967,19 @@ class WanModel(torch.nn.Module):
             x=self.patch_size[0], y=self.patch_size[1], z=self.patch_size[2]
         )
 
-    def enable_fantasy_world_mode(self, split_layer=12):
+    def enable_fantasy_world_mode(self, split_layer=12, training_stage="stage2"):
+        """
+        Enable Fantasy World mode with two-stage training support.
+        
+        Args:
+            split_layer: Index where to split video branch (PCB) from IRG blocks
+            training_stage: One of ["stage1", "stage2"]
+                - "stage1": Only geometry branch trainable (latent_bridge, geo_blocks, heads, pose_enc, tokens)
+                - "stage2": Add interaction modules (irg_cross_attns, camera_adapters) + keep geometry branch trainable
+        """
         self.enable_fantasy_world = True
         self.split_layer = split_layer
+        self.training_stage = training_stage
         
         # Define feature extraction layers within IRG blocks (relative indices)
         # For 18 IRG blocks: layer 6, 9, 12, 18 (indices 5, 8, 11, 17)
@@ -899,17 +991,28 @@ class WanModel(torch.nn.Module):
             num_geo_layers - 1                # last layer (index 17 for 18 layers)
         ]
         
-        # 1. Pose Encoder (for Plucker Embedding)
+        # Stage 1: Latent Bridging
+        # Lightweight transformer adapter to map video features to geometry-aligned space
+        # Input: features from block 16 (split_layer block)
+        # Output: geometry-aligned latent for geometry branch
+        self.latent_bridge = LatentBridgeAdapter(
+            dim=self.dim,
+            num_heads=8,  # Can be tuned, typically 8 heads for lightweight adapter
+            ffn_dim=self.dim * 4,
+            num_layers=2  # Lightweight: only 2 layers
+        )
+        
+        # Stage 2: Pose Encoder (for Plucker Embedding)
         self.pose_enc = PoseEncoder(in_dim=9, out_dim=self.dim)
         
-        # 2. Tokens (Camera + Registers)
+        # Stage 3: Tokens (Camera + Registers)
         # "Concatenate one learned camera token and four register tokens"
         # Note: Camera token is a SINGLE token per video (not per frame)
         # The CameraHead will temporally upsample to get per-frame predictions
         self.token_camera = nn.Parameter(torch.randn(1, 1, self.dim) * 0.02)
         self.tokens_register = nn.Parameter(torch.randn(1, 4, self.dim) * 0.02)
 
-        # 3. Heads
+        # Stage 4: Heads
         # Camera Head
         self.head_camera = CameraHead(self.dim, out_dim=9)
         
@@ -926,7 +1029,7 @@ class WanModel(torch.nn.Module):
             output_dim=4
         )
 
-        # 4. Camera Adapters (Video Branch Injection)
+        # Stage 5: Camera Adapters (Video Branch Injection)
         # Paper: "applied to the first 24 of 40 blocks" -> for 30 blocks, apply to first split_layer blocks
         # These adapters predict only the SHIFT beta_i (not full AdaLN with scale+shift)
         # Injection: f_i = f_{i-1} + beta_i
@@ -938,23 +1041,124 @@ class WanModel(torch.nn.Module):
             for i in range(len(self.blocks))
         ])
         
-        # 5. Geometry Projector
-        self.geo_projector = nn.Linear(self.dim, self.dim)
-        
-        # 6. Geometry Blocks
+        # Stage 6: Geometry Blocks
         self.geo_blocks = nn.ModuleList([
             GeoDiTBlock(self.blocks[i], self.dim) 
             for i in range(split_layer, len(self.blocks))
         ])
         
-        # 7. IRG Cross Attention
+        # Stage 7: IRG Cross Attention (Geometry-Video Feature Fusion)
         self.irg_cross_attns = nn.ModuleList([
             MMBiCrossAttention(self.dim, self.blocks[0].num_heads) 
             for _ in range(len(self.geo_blocks))
         ])
         
+        # =========================================================================
+        # Freeze/Unfreeze Strategy Based on Training Stage
+        # =========================================================================
+        
+        # ALWAYS freeze original video branch parameters (PCB + IRG video branch)
         for param in self.blocks.parameters():
             param.requires_grad = False
+        
+        if training_stage == "stage1":
+            # Stage 1: Latent Bridging
+            # TRAINABLE: latent_bridge, geo_blocks, heads, pose_enc, tokens
+            # FROZEN: camera_adapters, irg_cross_attns (not needed for latent bridging)
+            print("[FantasyWorld] Stage 1: Training geometry branch only")
+            
+            # Geometry branch: trainable
+            for param in self.latent_bridge.parameters():
+                param.requires_grad = True
+            for param in self.geo_blocks.parameters():
+                param.requires_grad = True
+            for param in self.pose_enc.parameters():
+                param.requires_grad = True
+            self.token_camera.requires_grad = True
+            self.tokens_register.requires_grad = True
+            for param in self.head_camera.parameters():
+                param.requires_grad = True
+            for param in self.head_depth.parameters():
+                param.requires_grad = True
+            for param in self.head_point.parameters():
+                param.requires_grad = True
+            
+            # Interaction modules: frozen (will not be used in Stage 1 forward)
+            for adapter in self.camera_adapters:
+                if adapter is not None:
+                    for param in adapter.parameters():
+                        param.requires_grad = False
+            for cross_attn in self.irg_cross_attns:
+                for param in cross_attn.parameters():
+                    param.requires_grad = False
+                    
+        elif training_stage == "stage2":
+            # Stage 2: Unified Co-Optimization
+            # TRAINABLE: All geometry branch + interaction modules (irg_cross_attns, camera_adapters)
+            # FROZEN: Still keep original blocks frozen
+            print("[FantasyWorld] Stage 2: Training interaction modules + geometry branch")
+            
+            # Geometry branch: trainable (keep from Stage 1)
+            for param in self.latent_bridge.parameters():
+                param.requires_grad = True
+            for param in self.geo_blocks.parameters():
+                param.requires_grad = True
+            for param in self.pose_enc.parameters():
+                param.requires_grad = True
+            self.token_camera.requires_grad = True
+            self.tokens_register.requires_grad = True
+            for param in self.head_camera.parameters():
+                param.requires_grad = True
+            for param in self.head_depth.parameters():
+                param.requires_grad = True
+            for param in self.head_point.parameters():
+                param.requires_grad = True
+            
+            # Interaction modules: trainable (NEW in Stage 2)
+            for adapter in self.camera_adapters:
+                if adapter is not None:
+                    for param in adapter.parameters():
+                        param.requires_grad = True
+            for cross_attn in self.irg_cross_attns:
+                for param in cross_attn.parameters():
+                    param.requires_grad = True
+        else:
+            raise ValueError(f"Unknown training_stage: {training_stage}. Must be 'stage1' or 'stage2'")
+        
+        # =========================================================================
+        # DType and Device Conversion
+        # =========================================================================
+        # CRITICAL: Convert all new Fantasy World modules to match main model's dtype and device
+        # This ensures consistency when BFloat16 training is used
+        # Get reference dtype and device from existing model parameters
+        ref_param = next(self.blocks[0].parameters())
+        target_dtype = ref_param.dtype
+        target_device = ref_param.device
+        
+        # Convert all new modules
+        self.latent_bridge = self.latent_bridge.to(dtype=target_dtype, device=target_device)
+        self.pose_enc = self.pose_enc.to(dtype=target_dtype, device=target_device)
+        
+        # For nn.Parameter, we need to modify .data directly or wrap with nn.Parameter
+        # Using .data is safer as it preserves requires_grad
+        self.token_camera.data = self.token_camera.data.to(dtype=target_dtype, device=target_device)
+        self.tokens_register.data = self.tokens_register.data.to(dtype=target_dtype, device=target_device)
+        
+        self.head_camera = self.head_camera.to(dtype=target_dtype, device=target_device)
+        self.head_depth = self.head_depth.to(dtype=target_dtype, device=target_device)
+        self.head_point = self.head_point.to(dtype=target_dtype, device=target_device)
+        
+        for i, adapter in enumerate(self.camera_adapters):
+            if adapter is not None:
+                self.camera_adapters[i] = adapter.to(dtype=target_dtype, device=target_device)
+        
+        for i, block in enumerate(self.geo_blocks):
+            self.geo_blocks[i] = block.to(dtype=target_dtype, device=target_device)
+        
+        for i, cross_attn in enumerate(self.irg_cross_attns):
+            self.irg_cross_attns[i] = cross_attn.to(dtype=target_dtype, device=target_device)
+        
+        print(f"[FantasyWorld] Initialized {len(self.geo_blocks)} geometry blocks, {sum(1 for a in self.camera_adapters if a is not None)} camera adapters")
 
 
     def forward(self,

@@ -2,6 +2,12 @@
 /models
 /scripts
 /diffusers
+/outputs
+/test_outputs
+/test_data
+*.mp4
+*.txt
+/models
 *.pkl
 *.safetensors
 *.pth

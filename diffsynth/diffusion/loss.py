@@ -34,6 +34,40 @@ def DirectDistillLoss(pipe: BasePipeline, **inputs):
 
 # =============================================================================
 # [Fantasy World] Loss Implementation
+
+def parse_camera_txt(file_path, num_frames=None):
+    """
+    Parse camera txt file and extract w2c matrices.
+    
+    Format: Each line has [prefix...] [w2c_00, ..., w2c_23]
+    The last 12 values are the 3x4 w2c matrix flattened.
+    
+    Returns: torch.Tensor of shape [T, 12] containing w2c matrices
+    """
+    import os
+    if not os.path.exists(file_path):
+        return None
+    
+    w2c_matrices = []
+    with open(file_path, 'r') as f:
+        lines = f.readlines()
+        if num_frames:
+            lines = lines[:num_frames]
+        
+        for line in lines:
+            values = line.strip().split()
+            if len(values) < 12:
+                continue
+            # Extract last 12 values as w2c matrix
+            w2c = [float(v) for v in values[-12:]]
+            w2c_matrices.append(w2c)
+    
+    if len(w2c_matrices) == 0:
+        return None
+    
+    return torch.tensor(w2c_matrices, dtype=torch.float32)
+
+
 def FantasyWorldLoss(pipe: BasePipeline, **inputs):
     """
     Combined loss for Fantasy World training.
@@ -49,7 +83,7 @@ def FantasyWorldLoss(pipe: BasePipeline, **inputs):
     # 1. Video Diffusion Loss
     loss_diffusion = FlowMatchSFTLoss(pipe, **inputs)
     
-    loss_geo = 0.0
+    loss_geo = torch.tensor(0.0, device=pipe.device, dtype=pipe.torch_dtype)
     
     # 2. Geometry Branch Supervision
     
@@ -61,23 +95,43 @@ def FantasyWorldLoss(pipe: BasePipeline, **inputs):
         
         gt_depth = inputs.get("gt_depth", None)
         if gt_depth is not None:
-            # Ensure shape: both should be [B, T, 1, H, W]
-            if gt_depth.ndim == 4:  # [B, T, H, W] -> [B, T, 1, H, W]
-                gt_depth = gt_depth.unsqueeze(2)
+            # Convert gt_depth to same dtype and device as pred_depth
+            gt_depth = gt_depth.to(dtype=pred_depth.dtype, device=pred_depth.device)
             
-            # Permute to [B, 1, T, H, W] for easier temporal gradient computation
-            pred_depth = pred_depth.permute(0, 2, 1, 3, 4)  # [B, 1, T, H, W]
-            gt_depth = gt_depth.permute(0, 2, 1, 3, 4)      # [B, 1, T, H, W]
-             
-            # Interpolate GT to Pred resolution if needed
+            # Ensure shape: [B, T, 1, H, W]
+            if gt_depth.ndim == 3:  # [T, H, W] - single sample without batch
+                gt_depth = gt_depth.unsqueeze(0).unsqueeze(2)  # [1, T, 1, H, W]
+            elif gt_depth.ndim == 4:  # [B, T, H, W]
+                gt_depth = gt_depth.unsqueeze(2)  # [B, T, 1, H, W]
+            
+            # Ensure gt_depth is 5D before proceeding
+            assert gt_depth.ndim == 5, f"Expected gt_depth to be 5D [B,T,C,H,W], got shape {gt_depth.shape}"
+            
+            # Interpolate spatial dimensions if needed (BEFORE permuting)
             if pred_depth.shape[-2:] != gt_depth.shape[-2:]:
+                B, T, C, H_gt, W_gt = gt_depth.shape
+                _, _, _, H_pred, W_pred = pred_depth.shape
+                # Reshape to [B*T, C, H, W] for spatial interpolation (keep C separate)
+                gt_depth = gt_depth.reshape(B * T, C, H_gt, W_gt)
                 gt_depth = torch.nn.functional.interpolate(
-                    gt_depth.flatten(0, 2), size=pred_depth.shape[-2:], mode='bilinear', align_corners=True
-                ).view(*gt_depth.shape[:3], *pred_depth.shape[-2:])
-            if pred_depth.shape[2] != gt_depth.shape[2]:  # Temporal
-                gt_depth = torch.nn.functional.interpolate(
-                    gt_depth, size=pred_depth.shape[2:], mode='nearest'
+                    gt_depth, size=(H_pred, W_pred), mode='bilinear', align_corners=True
                 )
+                gt_depth = gt_depth.reshape(B, T, C, H_pred, W_pred)
+            
+            # Interpolate temporal dimension if needed
+            if pred_depth.shape[1] != gt_depth.shape[1]:  # T mismatch
+                B, T_gt, C, H, W = gt_depth.shape
+                T_pred = pred_depth.shape[1]
+                # Reshape to [B*C, T, H*W] for temporal interpolation
+                gt_depth = gt_depth.permute(0, 2, 1, 3, 4).reshape(B * C, T_gt, H * W)
+                gt_depth = torch.nn.functional.interpolate(
+                    gt_depth, size=T_pred, mode='linear', align_corners=True
+                )
+                gt_depth = gt_depth.reshape(B, C, T_pred, H, W).permute(0, 2, 1, 3, 4)
+            
+            # Now permute to [B, C, T, H, W] for temporal gradient computation
+            pred_depth = pred_depth.permute(0, 2, 1, 3, 4)  # [B, C, T, H, W]
+            gt_depth = gt_depth.permute(0, 2, 1, 3, 4)      # [B, C, T, H, W]
 
             # L_frame (MAE) - per-frame spatial loss
             loss_frame = torch.abs(pred_depth - gt_depth).mean()
@@ -106,18 +160,31 @@ def FantasyWorldLoss(pipe: BasePipeline, **inputs):
         
         gt_points = inputs.get("gt_points", None)
         if gt_points is not None:
+            # Convert gt_points to same dtype and device as pts_pred
+            gt_points = gt_points.to(dtype=pts_pred.dtype, device=pts_pred.device)
+            
             # Ensure shape: [B, T, 3, H, W]
-            if gt_points.ndim == 4:  # [B*T, 3, H, W]
-                b = pts_pred.shape[0]
-                t = pts_pred.shape[1]
-                gt_points = gt_points.view(b, t, 3, *gt_points.shape[-2:])
+            if gt_points.ndim == 4:  # [T, 3, H, W] - single sample
+                gt_points = gt_points.unsqueeze(0)  # [1, T, 3, H, W]
+            elif gt_points.ndim == 5:  # Already [B, T, 3, H, W]
+                pass
+            else:
+                # Try to infer correct shape
+                B = pts_pred.shape[0]
+                T = pts_pred.shape[1]
+                if gt_points.shape[0] == B * T:  # [B*T, 3, H, W]
+                    gt_points = gt_points.view(B, T, 3, *gt_points.shape[-2:])
              
-            # Resize GT if needed
+            # Resize spatial dimensions if needed
             if pts_pred.shape[-2:] != gt_points.shape[-2:]:
-                b, t, c, h, w = gt_points.shape
+                B, T, C, H_gt, W_gt = gt_points.shape
+                _, _, _, H_pred, W_pred = pts_pred.shape
+                # Reshape to [B*T, C, H, W] for spatial interpolation (keep C=3 separate)
+                gt_points = gt_points.reshape(B * T, C, H_gt, W_gt)
                 gt_points = torch.nn.functional.interpolate(
-                    gt_points.flatten(0, 1), size=pts_pred.shape[-2:], mode='bilinear', align_corners=True
-                ).view(b, t, c, *pts_pred.shape[-2:])
+                    gt_points, size=(H_pred, W_pred), mode='bilinear', align_corners=True
+                )
+                gt_points = gt_points.reshape(B, T, C, H_pred, W_pred)
             
             # Point Loss (uncertainty weighted)
             diff = (pts_pred - gt_points).abs()
@@ -145,27 +212,65 @@ def FantasyWorldLoss(pipe: BasePipeline, **inputs):
             loss_geo = loss_geo + loss_pts + loss_grad + loss_reg
 
     # --- C. Camera Loss ---
-    # L_camera = Robust Huber Loss on 9D camera parameters
+    # L_camera = Robust Huber Loss on camera parameters (w2c matrices)
     if hasattr(pipe.dit, 'last_camera_output') and pipe.dit.last_camera_output is not None:
         pred_cam = pipe.dit.last_camera_output  # [B, T, 9]
         pipe.dit.last_camera_output = None
         
-        gt_cam = inputs.get("pose_params", None)  # [B, T, 9] expected
-        if gt_cam is not None:
-            # Interpolate to match lengths if needed
-            if pred_cam.shape[1] != gt_cam.shape[1]:
-                pred_cam_tp = pred_cam.transpose(1, 2)  # [B, 9, T]
-                gt_len = gt_cam.shape[1]
-                pred_cam_tp = torch.nn.functional.interpolate(
-                    pred_cam_tp, size=gt_len, mode='linear', align_corners=True
-                )
-                pred_cam = pred_cam_tp.transpose(1, 2)
+        # Parse ground truth from txt file
+        gt_camera_file = inputs.get("gt_camera_file", None)
+        if gt_camera_file is not None:
+            # Handle batch: gt_camera_file could be a list or single path
+            if isinstance(gt_camera_file, (list, tuple)):
+                gt_camera_file = gt_camera_file[0]
             
-            # Robust Huber Loss (less sensitive to outliers)
-            loss_cam = torch.nn.functional.huber_loss(pred_cam, gt_cam, delta=1.0)
+            # Parse txt file to get w2c matrices [T, 12]
+            gt_w2c = parse_camera_txt(gt_camera_file, num_frames=pred_cam.shape[1])
             
-            # Paper uses 3x weight for camera loss
-            loss_geo = loss_geo + 3.0 * loss_cam
+            if gt_w2c is not None:
+                # Convert to same dtype and device as pred_cam
+                gt_w2c = gt_w2c.to(dtype=pred_cam.dtype, device=pred_cam.device)
+                # Add batch dimension if needed: [T, 12] -> [1, T, 12]
+                if gt_w2c.ndim == 2:
+                    gt_w2c = gt_w2c.unsqueeze(0)
+                
+                # Interpolate to match lengths if needed
+                if pred_cam.shape[1] != gt_w2c.shape[1]:
+                    gt_w2c = torch.nn.functional.interpolate(
+                        gt_w2c.permute(0, 2, 1),  # [B, 12, T]
+                        size=pred_cam.shape[1],
+                        mode='linear',
+                        align_corners=True
+                    ).permute(0, 2, 1)  # [B, T, 12]
+                
+                # Extract rotation (first 9 values) and translation (last 3 values)
+                # from w2c matrix [3x4 flattened]
+                gt_rot = gt_w2c[:, :, :9]   # [B, T, 9] - rotation matrix
+                gt_trans = gt_w2c[:, :, 9:] # [B, T, 3] - translation vector
+                
+                # If pred_cam is [B, T, 9], assume it's [rot(3), trans(3), fov(3)]
+                # We compare rotation (first 3) and translation (next 3)
+                if pred_cam.shape[-1] == 9:
+                    pred_rot = pred_cam[:, :, :3]   # Simplified rotation (e.g., euler angles)
+                    pred_trans = pred_cam[:, :, 3:6]  # Translation
+                    
+                    # For rotation: we can't directly compare euler vs matrix
+                    # So just use translation loss for now (more stable)
+                    loss_cam = torch.nn.functional.huber_loss(pred_trans, gt_trans, delta=1.0)
+                elif pred_cam.shape[-1] == 12:
+                    # Direct comparison with w2c
+                    loss_cam = torch.nn.functional.huber_loss(pred_cam, gt_w2c, delta=1.0)
+                else:
+                    # Fallback: just use what we have
+                    min_dim = min(pred_cam.shape[-1], gt_w2c.shape[-1])
+                    loss_cam = torch.nn.functional.huber_loss(
+                        pred_cam[:, :, :min_dim], 
+                        gt_w2c[:, :, :min_dim], 
+                        delta=1.0
+                    )
+                
+                # Paper uses 3x weight for camera loss
+                loss_geo = loss_geo + 3.0 * loss_cam
                     
     return loss_diffusion + loss_geo
 # =============================================================================

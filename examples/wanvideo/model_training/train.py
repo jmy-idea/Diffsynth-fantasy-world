@@ -1,6 +1,18 @@
-import torch, os, argparse, accelerate, warnings
+import torch, os, argparse, accelerate, warnings, sys
+
+# Add project root to path to enable diffsynth import
+# Find the project root by going up from this script location
+script_dir = os.path.dirname(os.path.abspath(__file__))
+# Go up 5 levels: examples/wanvideo/model_training/train.py -> Diffsynth-fantasy-world
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(script_dir))))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 from diffsynth.core import UnifiedDataset
 from diffsynth.core.data.operators import LoadVideo, LoadAudio, ImageCropAndResize, ToAbsolutePath
+from diffsynth.core.data.fantasy_world_operators import (
+    default_depth_operator, default_points_operator, default_camera_operator
+)
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.diffusion import *
 from diffsynth.diffusion.loss import FantasyWorldLoss
@@ -52,9 +64,17 @@ class WanTrainingModule(DiffusionTrainingModule):
         self.extra_inputs = extra_inputs.split(",") if extra_inputs is not None else []
         self.fp8_models = fp8_models
         self.task = task
+        
+        # Parse Fantasy World training stage (if task is fantasy_world:stage1 or fantasy_world:stage2)
+        training_stage = "stage2"  # Default
         if self.task.startswith("fantasy_world"):
+            if ":" in self.task:
+                stage_str = self.task.split(":")[-1]
+                if stage_str in ["stage1", "stage2"]:
+                    training_stage = stage_str
+            
             if hasattr(self.pipe.dit, "enable_fantasy_world_mode"):
-                self.pipe.dit.enable_fantasy_world_mode()
+                self.pipe.dit.enable_fantasy_world_mode(training_stage=training_stage)
 
         self.task_to_loss = {
             "sft:data_process": lambda pipe, *args: args,
@@ -65,10 +85,42 @@ class WanTrainingModule(DiffusionTrainingModule):
             "direct_distill:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
             "fantasy_world": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FantasyWorldLoss(pipe, **inputs_shared, **inputs_posi),
             "fantasy_world:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FantasyWorldLoss(pipe, **inputs_shared, **inputs_posi),
+            "fantasy_world:stage1": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FantasyWorldLoss(pipe, **inputs_shared, **inputs_posi),
+            "fantasy_world:stage2": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FantasyWorldLoss(pipe, **inputs_shared, **inputs_posi),
         }
         self.max_timestep_boundary = max_timestep_boundary
         self.min_timestep_boundary = min_timestep_boundary
         
+    def export_trainable_state_dict(self, state_dict, remove_prefix=None):
+        """
+        Override to save complete dit model for Fantasy World, not just trainable params.
+        For fantasy_world tasks, we need the full dit (both frozen and trainable parts)
+        for inference, not just the trainable parameters.
+        """
+        if self.task.startswith("fantasy_world"):
+            # For Fantasy World: save entire dit + new geometry modules
+            trainable_param_names = self.trainable_param_names()
+            # Include both frozen dit params and trainable fantasy world params
+            state_dict_filtered = {}
+            for name, param in state_dict.items():
+                # Keep dit.blocks.* (frozen) and all trainable params
+                if name.startswith("dit.") or name in trainable_param_names:
+                    state_dict_filtered[name] = param
+            state_dict = state_dict_filtered
+        else:
+            # For other tasks: use standard logic (only trainable params)
+            trainable_param_names = self.trainable_param_names()
+            state_dict = {name: param for name, param in state_dict.items() if name in trainable_param_names}
+        
+        if remove_prefix is not None:
+            state_dict_ = {}
+            for name, param in state_dict.items():
+                if name.startswith(remove_prefix):
+                    name = name[len(remove_prefix):]
+                state_dict_[name] = param
+            state_dict = state_dict_
+        return state_dict
+    
     def parse_extra_inputs(self, data, extra_inputs, inputs_shared):
         for extra_input in extra_inputs:
             if extra_input == "input_image":
@@ -77,8 +129,41 @@ class WanTrainingModule(DiffusionTrainingModule):
                 inputs_shared["end_image"] = data["video"][-1]
             elif extra_input == "reference_image" or extra_input == "vace_reference_image":
                 inputs_shared[extra_input] = data[extra_input][0]
+            elif extra_input == "pose_file_path":
+                # For Fantasy World: camera_params is the txt file path
+                # This will be processed by WanVideoUnit_FunCameraControl
+                if "camera_params" in data:
+                    inputs_shared["pose_file_path"] = data["camera_params"]
+                else:
+                    inputs_shared["pose_file_path"] = None
             else:
                 inputs_shared[extra_input] = data[extra_input]
+        
+        # Handle Fantasy World geometry data (rename keys for loss computation)
+        if self.task.startswith("fantasy_world"):
+            # Map depth -> gt_depth
+            if "depth" in data and data["depth"] is not None:
+                depth = data["depth"]
+                if isinstance(depth, torch.Tensor):
+                    if depth.ndim == 3:  # [T, H, W] -> [1, T, H, W]
+                        depth = depth.unsqueeze(0)
+                    inputs_shared["gt_depth"] = depth
+            # Map points -> gt_points  
+            if "points" in data and data["points"] is not None:
+                points = data["points"]
+                if isinstance(points, torch.Tensor):
+                    if points.ndim == 4:  # [T, H, W, 3] -> [1, T, H, W, 3]
+                        points = points.unsqueeze(0)
+                        # Permute to [B, T, 3, H, W]
+                        points = points.permute(0, 1, 4, 2, 3)
+                    inputs_shared["gt_points"] = points
+            # Camera params: the txt file path is passed via pose_file_path
+            # WanVideoUnit_FunCameraControl will parse it and generate pose_params
+            # For loss computation, we'll extract ground truth from the same file
+            if "camera_params" in data and data["camera_params"] is not None:
+                # Store the path for later extraction during loss computation
+                inputs_shared["gt_camera_file"] = data["camera_params"]
+                    
         return inputs_shared
     
     def get_pipeline_inputs(self, data):
@@ -134,11 +219,33 @@ if __name__ == "__main__":
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],
     )
+    
+    # Build special operator map based on task
+    special_operator_map = {
+        "animate_face_video": ToAbsolutePath(args.dataset_base_path) >> LoadVideo(args.num_frames, 4, 1, frame_processor=ImageCropAndResize(512, 512, None, 16, 16)),
+        "input_audio": ToAbsolutePath(args.dataset_base_path) >> LoadAudio(sr=16000),
+    }
+    
+    # Add Fantasy World specific operators if task is fantasy_world
+    if args.task.startswith("fantasy_world"):
+        special_operator_map.update({
+            "depth": default_depth_operator(args.dataset_base_path, args.num_frames),
+            "points": default_points_operator(args.dataset_base_path, args.num_frames),
+            "camera_params": default_camera_operator(args.dataset_base_path),
+        })
+        # Extend data_file_keys for fantasy_world
+        data_file_keys = args.data_file_keys.split(",")
+        for key in ["depth", "points", "camera_params"]:
+            if key not in data_file_keys:
+                data_file_keys.append(key)
+    else:
+        data_file_keys = args.data_file_keys.split(",")
+    
     dataset = UnifiedDataset(
         base_path=args.dataset_base_path,
         metadata_path=args.dataset_metadata_path,
         repeat=args.dataset_repeat,
-        data_file_keys=args.data_file_keys.split(","),
+        data_file_keys=data_file_keys,
         main_data_operator=UnifiedDataset.default_video_operator(
             base_path=args.dataset_base_path,
             max_pixels=args.max_pixels,
@@ -150,10 +257,7 @@ if __name__ == "__main__":
             time_division_factor=4,
             time_division_remainder=1,
         ),
-        special_operator_map={
-            "animate_face_video": ToAbsolutePath(args.dataset_base_path) >> LoadVideo(args.num_frames, 4, 1, frame_processor=ImageCropAndResize(512, 512, None, 16, 16)),
-            "input_audio": ToAbsolutePath(args.dataset_base_path) >> LoadAudio(sr=16000),
-        }
+        special_operator_map=special_operator_map,
     )
     model = WanTrainingModule(
         model_paths=args.model_paths,
@@ -188,5 +292,9 @@ if __name__ == "__main__":
         "sft:train": launch_training_task,
         "direct_distill": launch_training_task,
         "direct_distill:train": launch_training_task,
+        "fantasy_world": launch_training_task,
+        "fantasy_world:train": launch_training_task,
+        "fantasy_world:stage1": launch_training_task,
+        "fantasy_world:stage2": launch_training_task,
     }
     launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)

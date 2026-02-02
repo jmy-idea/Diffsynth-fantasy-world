@@ -17,6 +17,8 @@ pipe = WanVideoPipeline.from_pretrained(
     tokenizer_config=ModelConfig(model_id="Wan-AI/Wan2.1-T2V-1.3B", origin_file_pattern="google/umt5-xxl/"),
 )
 
+# state_dict = load_state_dict("/ML-vePFS/research_gen/jmy/jmy_ws/Diffsynth-fantasy-world/outputs/fantasy_world_stage1/step-2.safetensors")
+# missing, unexpected = pipe.dit.load_state_dict(state_dict, strict=False)
 
 dataset_snapshot_download(
     dataset_id="DiffSynth-Studio/examples_in_diffsynth",

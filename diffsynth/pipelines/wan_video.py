@@ -1389,22 +1389,25 @@ def model_fn_wan_video(
                                x_geo = torch.cat([x_geo, cam_token, reg_tokens], dim=1)
                      
                      if x_geo is not None and hasattr(dit, 'geo_blocks') and hasattr(dit, 'irg_cross_attns'):
+                         # Expand freqs for extra tokens (camera + register = 5 tokens total)
+                         # freqs: [F*H*W, 1, D/H], x_geo: [B, F*H*W+5, C]
+                         if x_geo.shape[1] > freqs.shape[0]:
+                             extra_len = x_geo.shape[1] - freqs.shape[0]
+                             # Pad with zeros for extra tokens (they don't need positional encoding)
+                             freqs_ext = torch.cat([
+                                 freqs, 
+                                 torch.zeros(extra_len, *freqs.shape[1:], device=freqs.device, dtype=freqs.dtype)
+                             ], dim=0)
+                         else:
+                             freqs_ext = freqs
+                         
                          if use_gradient_checkpointing:
-                             # TODO: Handle freqs padding in gradient checkpointing if needed
                              x_geo = torch.utils.checkpoint.checkpoint(
                                  create_custom_forward(dit.geo_blocks[idx]), 
-                                 x_geo, context, t_mod, freqs, pose_emb,
+                                 x_geo, context, t_mod, freqs_ext, pose_emb,
                                  use_reentrant=False
                              )
                          else:
-                             # Expand freqs for extra tokens (1 + 4 = 5) with 0 frequency
-                             # freqs: [F*H*W, 1, D/H]
-                             if x_geo.shape[1] > freqs.shape[0]:
-                                 extra_len = x_geo.shape[1] - freqs.shape[0]
-                                 freqs_ext = torch.cat([freqs, torch.zeros(extra_len, *freqs.shape[1:], device=freqs.device, dtype=freqs.dtype)], dim=0)
-                             else:
-                                 freqs_ext = freqs
-                                 
                              # Pass modified freqs
                              x_geo = dit.geo_blocks[idx](x_geo, context, t_mod, freqs_ext, pose_emb) 
                          
