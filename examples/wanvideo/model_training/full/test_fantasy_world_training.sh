@@ -65,8 +65,8 @@ python examples/wanvideo/model_training/train.py \
     --dataset_base_path "${TEST_DATA_DIR}" \
     --dataset_metadata_path "${TEST_DATA_DIR}/metadata.json" \
     --dataset_repeat 1 \
-    --height 128 \
-    --width 128 \
+    --height 480 \
+    --width 832 \
     --output_path "${OUTPUT_DIR}" \
     --task fantasy_world \
     --trainable_models "dit" \
