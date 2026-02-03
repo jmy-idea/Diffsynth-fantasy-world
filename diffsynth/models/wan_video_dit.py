@@ -550,13 +550,46 @@ def _make_fusion_block(features, use_bn=False, size=None, has_residual=True):
         has_residual=has_residual,
     )
 
+
+class CausalConv3d(nn.Conv3d):
+    """
+    Causal 3D convolution: time dimension only looks to the past.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # padding order for F.pad: (W_l, W_r, H_l, H_r, T_l, T_r)
+        self._padding = (
+            self.padding[2], self.padding[2],
+            self.padding[1], self.padding[1],
+            2 * self.padding[0], 0
+        )
+        self.padding = (0, 0, 0)
+
+    def forward(self, x, cache_x=None):
+        padding = list(self._padding)
+
+        if cache_x is not None and padding[4] > 0:
+            cache_x = cache_x.to(x.device)
+            x = torch.cat([cache_x, x], dim=2)
+            padding[4] -= cache_x.shape[2]
+
+        x = F.pad(x, padding)
+        return super().forward(x)
+
+
 class TemporalUpsampleBlock(nn.Module):
     """Temporal upsampling block inspired by WanVAE decoder.
     Doubles temporal resolution then applies causal 3D conv.
     """
     def __init__(self, channels: int):
         super().__init__()
-        self.conv = nn.Conv3d(channels, channels, kernel_size=(3, 3, 3), padding=(1, 1, 1))
+        self.conv = CausalConv3d(
+            channels,
+            channels,
+            kernel_size=(3, 3, 3),
+            padding=(1, 1, 1)
+        )
         self.act = nn.SiLU()
         
     def forward(self, x):
@@ -566,7 +599,6 @@ class TemporalUpsampleBlock(nn.Module):
         x = self.conv(x)
         x = self.act(x)
         return x
-
 
 class DPTHead3D(nn.Module):
     """3D DPT Head with inverted reassemble logic and temporal upsampling.
@@ -620,8 +652,8 @@ class DPTHead3D(nn.Module):
         
         # Temporal upsampling blocks: 2 blocks for 4x temporal upsampling
         # T_out = (T_in - 1) * 4 + 1
-        self.temporal_block1 = TemporalUpsampleBlock(output_dim)
-        self.temporal_block2 = TemporalUpsampleBlock(output_dim)
+        self.temporal_blocks1 = nn.ModuleList([TemporalUpsampleBlock(out_channels[i]) for i in range(4)])
+        self.temporal_blocks2 = nn.ModuleList([TemporalUpsampleBlock(out_channels[i]) for i in range(4)])
 
     def forward(self, features_list, h, w):
         """
@@ -645,9 +677,22 @@ class DPTHead3D(nn.Module):
             feat = feat.view(b, f, h, w, c).permute(0, 1, 4, 2, 3).flatten(0, 1)
             # Project channels
             feat = self.projects[i](feat)
+            
             # Apply inverted resize
             feat = self.resize_layers[i](feat)
-            out.append(feat)
+            
+
+
+            # temporal after ressemble 
+            _, c, h_feat, w_feat = feat.shape
+            f = feat.shape[0] // b
+            feat = feat.view(b, f, c, h_feat, w_feat).permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
+           
+            feat = self.temporal_blocks1[i](feat)
+            feat = self.temporal_blocks2[i](feat)
+            t_target = (f - 1) * 4 + 1
+            feat = feat[:, :, :t_target, :, :]
+            out.append(feat.permute(0, 2, 1, 3, 4).flatten(0, 1))
         
         # RefineNet fusion (from deep to shallow)
         layer_1, layer_2, layer_3, layer_4 = out
@@ -683,21 +728,22 @@ class DPTHead3D(nn.Module):
         
         # Spatial output
         spatial_out = self.output_head(path_1)  # [B*F, output_dim, H_out, W_out]
-        
+       
         # Reshape for temporal processing
         _, c_out, h_out, w_out = spatial_out.shape
-        spatial_out = spatial_out.view(b, f, c_out, h_out, w_out)  # [B, F, C, H, W]
-        spatial_out = spatial_out.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
+    
+        temporal_out = spatial_out.view(b, t_target, c_out, h_out, w_out)  # [B, F, C, H, W]
+        # spatial_out = spatial_out.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
         
         # Temporal upsampling: 4x (from F frames to T = (F-1)*4+1 frames)
-        temporal_out = self.temporal_block1(spatial_out)
-        temporal_out = self.temporal_block2(temporal_out)
-        # Trim to exact target length: T = (F-1)*4 + 1
-        t_target = (f - 1) * 4 + 1
-        temporal_out = temporal_out[:, :, :t_target, :, :]  # [B, C, T, H, W]
+        # temporal_out = self.temporal_block1(spatial_out)
+        # temporal_out = self.temporal_block2(temporal_out)
+        # # Trim to exact target length: T = (F-1)*4 + 1
+        # t_target = (f - 1) * 4 + 1
+        # temporal_out = temporal_out[:, :, :t_target, :, :]  # [B, C, T, H, W]
         
         # Permute to [B, T, C, H, W]
-        temporal_out = temporal_out.permute(0, 2, 1, 3, 4)
+        # temporal_out = temporal_out.permute(0, 2, 1, 3, 4)
         
         if self.output_dim == 1:
             # Depth output: [B, T, 1, H, W]
@@ -714,6 +760,7 @@ class DPTHead3D(nn.Module):
             pts = pts.view(b_t, t_out, 3, h_out, w_out)
             conf = conf.view(b_t, t_out, 1, h_out, w_out)
             return pts, conf
+
 
 
 # Keep old name for compatibility
