@@ -23,14 +23,14 @@
 ```
 输入编码
     ↓
-30 层 DiT (Diffusion Transformer) Blocks
-    ├─ Block 0-11: PCB (Preconditioning Blocks) - 冻结
-    └─ Block 12-29: IRG (Integrated Reconstruction & Generation) - 冻结
+30 层 DiT (Diffusion Transformer) Blocks - 全部冻结
     ↓
 噪声预测
     ↓
 输出解码 → 视频帧
 ```
+
+**注**: Wan2.1 是一个统一的 DiT 架构，所有 30 个 blocks 按层序递进。没有"PCB"或"IRG"这样的特殊命名。这些概念是在 Fantasy World 扩展中才引入的。
 
 ### 参数统计
 
@@ -39,7 +39,7 @@
 | 嵌入层 | ~50M | Token 和位置编码 |
 | 30 × DiT Block | ~1550M | 主要计算 |
 | 输出层 | ~16M | 噪声预测头 |
-| **总计** | **~1616M** | 1.3B 模型 |
+| **总计** | **~1616M** | 1.3B 模型，全部冻结 |
 
 ### 关键特性
 
@@ -65,38 +65,43 @@
 ### 架构对比
 
 ```
-Wan2.1 (冻结)                       Fantasy World (扩展)
-──────────────                      ────────────────────
+Wan2.1 (纯视频生成)                    Fantasy World (几何感知生成)
+────────────────────────────────────────────────────────────────────────
                                     
       输入                               输入
        ↓                                  ↓
-    Block 0-11 (PCB)                 Block 0-11 (PCB) ❄️ 冻结
-    所有参数冻结 ❄️                     ↓
-       ↓                           ┌─────────────────┐
-    Block 12-29 (IRG)              │ Latent Bridge   │
-    所有参数冻结 ❄️                │  Adapter ✅ 可训 │
-       ↓                           └────────┬────────┘
-    最终输出 (视频)                          ↓
-                                  ┌──────────────────┐
-                                  │ GeoDiT Blocks    │ ✅ 可训
-                                  │ (18 layers)      │
-                                  └──────────┬───────┘
-                                             ↓
-                                  ┌──────────────────────┐
-                                  │ DPT Heads            │
-                                  │ ├─ Depth Head        │ ✅ 可训
-                                  │ ├─ Point Cloud Head  │
-                                  │ └─ Camera Head       │
-                                  └──────────┬───────────┘
-                                             ↓
-                                  ┌──────────────────────┐
-                                  │ Stage 2 Modules      │
-                                  │ ├─ Camera Adapters   │ ✅ 可训
-                                  │ └─ IRG Cross-Attn    │ (Stage 2)
-                                  └──────────┬───────────┘
-                                             ↓
+    Block 0-29 ❄️ 冻结               Block 0-29 ❄️ 冻结
+    (30 个 DiT blocks)              (原始 Wan blocks)
+       ↓                                  ↓
+    最终输出 (视频)                 ┌──────────────────────────────────┐
+                                  │ Latent Bridge Adapter  ✅ 可训     │
+                                  │ (轻量级适配层)                     │
+                                  └────────────┬─────────────────────┘
+                                               ↓
+                                  ┌──────────────────────────────────┐
+                                  │ GeoDiT Blocks (新增)  ✅ 可训     │
+                                  │ (18 个几何 DiT blocks)            │
+                                  └────────────┬─────────────────────┘
+                                               ↓
+                                  ┌──────────────────────────────────┐
+                                  │ DPT Heads (新增)  ✅ 可训         │
+                                  │ ├─ Depth Head                    │
+                                  │ ├─ Point Cloud Head              │
+                                  │ └─ Camera Head                   │
+                                  └────────────┬─────────────────────┘
+                                               ↓
+                                  ┌──────────────────────────────────┐
+                                  │ Stage 2 交互模块 (新增)  ✅ 可训   │
+                                  │ ├─ Camera Adapters (Stage 2)     │
+                                  │ └─ 交叉注意力模块 (Stage 2)       │
+                                  └────────────┬─────────────────────┘
+                                               ↓
                                   输出 (视频 + 深度 + 点云 + 相机参数)
 ```
+
+**关键区别**:
+- **Wan2.1**: 30 个 DiT blocks 全冻结，仅进行纯视频生成
+- **Fantasy World**: 保留 Wan blocks 冻结，新增 18 个 GeoDiT blocks + DPT heads 进行几何预测
 
 ---
 
@@ -104,17 +109,18 @@ Wan2.1 (冻结)                       Fantasy World (扩展)
 
 ### 修改总览
 
-| 模块 | 原始 | 修改 | 状态 | 参数 |
-|------|------|------|------|------|
-| PCB (Block 0-11) | 冻结 | 保持冻结 | ❄️ | 1616M (全) |
-| IRG (Block 12-29) | 冻结 | 保持冻结 | ❄️ | (同上) |
-| **新增: Latent Bridge** | - | 轻量级适配器 | ✅ Stage 1 | ~5M |
-| **新增: GeoDiT Blocks** | - | 18 个几何块 | ✅ Stage 1 | ~900M |
-| **新增: DPT Heads** | - | 3 个预测头 | ✅ Stage 1 | ~50M |
-| **新增: Pose Encoder** | - | 相机编码器 | ✅ Stage 1 | ~1M |
-| **新增: 特殊 Tokens** | - | Camera + Register | ✅ Stage 1 | ~0.01M |
-| **新增: Camera Adapters** | - | 12 个控制模块 | ✅ Stage 2 | ~30M |
-| **新增: IRG Cross-Attn** | - | 18 个交互模块 | ✅ Stage 2 | ~200M |
+| 模块 | 原始 Wan | 修改方式 | 可训练性 | 参数 |
+|------|---------|---------|--------|------|
+| Block 0-29 (全部) | 冻结 | 保持冻结 | ❄️ 冻结 | 1616M |
+| **新增: Latent Bridge** | - | 新增 | ✅ Stage 1 | ~5M |
+| **新增: GeoDiT Blocks** | - | 新增 18 层 | ✅ Stage 1 | ~900M |
+| **新增: DPT Heads** | - | 新增 3 个 | ✅ Stage 1 | ~50M |
+| **新增: Pose Encoder** | - | 新增 | ✅ Stage 1 | ~1M |
+| **新增: 特殊 Tokens** | - | 新增 | ✅ Stage 1 | ~0.01M |
+| **新增: Camera Adapters** | - | 新增 12 个 | ✅ Stage 2 | ~30M |
+| **新增: 交叉注意力模块** | - | 新增 18 个 | ✅ Stage 2 | ~200M |
+
+**说明**: 原始 Wan 的 30 个 DiT blocks 在 Fantasy World 中**始终保持冻结**，不参与任何训练。
 
 ### Stage 1 vs Stage 2 可训练性
 
@@ -126,13 +132,13 @@ Stage 1 (Latent Bridging):
 - ✅ Pose Encoder
 - ✅ Special Tokens
 - ❄️ Camera Adapters (冻结)
-- ❄️ IRG Cross-Attention (冻结)
+- ❄️ 交叉注意力模块 (冻结)
 - ❄️ Wan2.1 原始 30 blocks (始终冻结)
 
 Stage 2 (Unified Co-Optimization):
 - ✅ 保留 Stage 1 所有可训练
 - ✅ Camera Adapters (解冻)
-- ✅ IRG Cross-Attention (解冻)
+- ✅ 交叉注意力模块 (解冻)
 - ❄️ Wan2.1 原始 30 blocks (始终冻结)
 ```
 
@@ -613,13 +619,11 @@ def enable_fantasy_world_mode(self, training_stage="stage2"):
 
 | 论文部分 | 我们的实现 | 文件位置 |
 |---------|---------|---------|
-| "30 层 DiT" | `WanModel` 中的 30 个 blocks | `wan_video_dit.py` L1-50 |
-| "冻结的视频 VFM" | Block 0-29 全部冻结 | `wan_video_dit.py` L500+ |
-| "可训练的几何分支" | GeoDiT blocks (18) | `wan_video_dit.py` L51-120 |
-| "PCB" | Block 0-11 | `wan_video_dit.py` L12 (split_layer) |
-| "IRG" | Block 12-29 + GeoDiT | `wan_video_dit.py` L12-29 + L51-120 |
+| 论文部分 | 我们的实现 | 文件位置 |
+|---------|---------|---------|
+| "Wan2.1 的 30 层 DiT" | Wan2.1 原始 blocks (冻结) | `wan_video_dit.py` L1-600 (冻结部分) |
+| "几何感知分支" | GeoDiT blocks (18) + DPT heads | `wan_video_dit.py` L51-350 |
 | "Latent Bridge" | LatentBridgeAdapter | `wan_video_dit.py` L1-50 |
-| "DPT 头" | DPTHead (3 个) | `wan_video_dit.py` L121-200 |
 | "相机编码器" | PoseEncoder | `wan_video_dit.py` L231-270 |
 
 ### 论文 Section 4.3 (两阶段训练)
@@ -645,14 +649,14 @@ def enable_fantasy_world_mode(self, training_stage="stage2"):
 | | Pose Encoder | 1M | 956M |
 | | Tokens | 0.01M | 956M |
 | **Stage 2 新增** | Camera Adapters | 30M | 986M |
-| | IRG Cross-Attention | 200M | 1186M |
+| | 交叉注意力模块 | 200M | 1186M |
 | | **Stage 2 总计** | - | **1186M** |
 
 ### 冻结参数 (始终)
 
 | 模块 | 参数量 |
 |------|--------|
-| Wan2.1 Block 0-29 | 1616M |
+| Wan2.1 Block 0-29 (全部) | 1616M |
 | **总冻结** | **1616M** |
 
 ### 全模型总参数
@@ -674,7 +678,7 @@ Stage 2: 1186M (可训) + 1616M (冻结) = 2802M
 
 ### 2. 为什么 GeoDiT 需要 18 层？
 
-- 与 Wan2.1 的 IRG 层数匹配
+- 与 Wan2.1 的后期 DiT 块数匹配 (Block 12-29，共 18 层)
 - 提供足够的容量处理几何信息
 - 减少层数会降低表达能力
 
