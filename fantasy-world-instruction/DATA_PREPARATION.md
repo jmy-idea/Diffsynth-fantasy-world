@@ -115,7 +115,7 @@ def normalize_depth(depth):
 
 ### 3. 点云格式
 
-**生成工具**: DUSt3R 或其他 MVS 方法
+**生成工具**: DUSt3R / CUT3R 或其他 MVS 方法
 
 **格式规范**:
 - 类型: `.npy` (numpy 格式)
@@ -157,6 +157,8 @@ def normalize_points(points):
 ```
 
 ### 4. 相机参数格式
+
+这里实际上前面7维保持" 0 0.532139961 0.946026558 0.5 0.5 0 0 "即可，只需要获得后面12维的w2c外参。参考Diffsynth-fantasy-world/Move_Left.txt
 
 **格式**: 19 值 per frame
 
@@ -235,10 +237,11 @@ def load_camera_trajectory(camera_file):
 **获取相机参数**:
 
 相机参数通常来自：
-1. **DUSt3R** (推荐): 从多视图重建得到
-2. **COLMAP**: 结构光重建工具
-3. **手动标注**: 如果有外参设备
-4. **估计**: 从 MVS 结果反推
+1. **DUSt3R** : 从多视图重建得到
+2. **ViPE** : 现在已有此pipeline
+3. **COLMAP**: 结构光重建工具
+4. **手动标注**: 如果有外参设备
+5. **估计**: 从 MVS 结果反推
 
 ---
 
