@@ -20,14 +20,13 @@ set -e
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="/ML-vePFS/research_gen/jmy/jmy_ws/Diffsynth-fantasy-world"
-DATA_DIR="/path/to/your/fantasy_world_data"  # TODO: Update this
-STAGE1_CHECKPOINT="${PROJECT_ROOT}/outputs/fantasy_world_stage1/step-20000.safetensors"  # Stage 1 output
+DATA_DIR="/ML-vePFS/research_gen/jmy/jmy_ws/Diffsynth-fantasy-world/test_data/fantasy_world_fake"  # TODO: Update this
+STAGE1_CHECKPOINT="${PROJECT_ROOT}/outputs/fantasy_world_stage1/step-2.safetensors"  # Stage 1 output
 OUTPUT_DIR="${PROJECT_ROOT}/outputs/fantasy_world_stage2"
 
 # Training Configuration
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7  # Adjust based on your GPUs
 NUM_GPUS=8
-BATCH_SIZE_PER_GPU=14  # 14 * 8 = 112 global batch size
 GRADIENT_ACCUMULATION=1
 NUM_STEPS=10000
 LEARNING_RATE=1e-5
@@ -43,7 +42,6 @@ echo "Data dir: ${DATA_DIR}"
 echo "Stage 1 checkpoint: ${STAGE1_CHECKPOINT}"
 echo "Output dir: ${OUTPUT_DIR}"
 echo "Num GPUs: ${NUM_GPUS}"
-echo "Global batch size: $((BATCH_SIZE_PER_GPU * NUM_GPUS))"
 echo "Training steps: ${NUM_STEPS}"
 echo ""
 
@@ -65,10 +63,11 @@ accelerate launch \
     --gradient_accumulation_steps ${GRADIENT_ACCUMULATION} \
     examples/wanvideo/model_training/train.py \
     --model_id_with_origin_paths "PAI/Wan2.1-Fun-V1.1-1.3B-Control-Camera:diffusion_pytorch_model*.safetensors,PAI/Wan2.1-Fun-V1.1-1.3B-Control-Camera:models_t5_umt5-xxl-enc-bf16.pth,PAI/Wan2.1-Fun-V1.1-1.3B-Control-Camera:Wan2.1_VAE.pth,PAI/Wan2.1-Fun-V1.1-1.3B-Control-Camera:models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth" \
+    --fantasy_world_checkpoint "${STAGE1_CHECKPOINT}" \
     --dataset_base_path "${DATA_DIR}" \
     --dataset_metadata_path "${DATA_DIR}/metadata.json" \
     --dataset_repeat 1 \
-    --dataset_num_workers 4 \
+    --dataset_num_workers 0 \
     --height ${HEIGHT} \
     --width ${WIDTH} \
     --num_frames ${NUM_FRAMES} \
@@ -76,7 +75,6 @@ accelerate launch \
     --task fantasy_world:stage2 \
     --trainable_models "dit" \
     --remove_prefix_in_ckpt "pipe.dit." \
-    --stage1_checkpoint "${STAGE1_CHECKPOINT}" \
     --data_file_keys "video,depth,points,camera_params" \
     --learning_rate ${LEARNING_RATE} \
     --weight_decay 1e-2 \

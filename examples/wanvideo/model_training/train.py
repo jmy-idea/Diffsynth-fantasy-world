@@ -36,6 +36,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         task="sft",
         max_timestep_boundary=1.0,
         min_timestep_boundary=0.0,
+        fantasy_world_checkpoint=None,
     ):
         super().__init__()
         # Warning
@@ -75,6 +76,35 @@ class WanTrainingModule(DiffusionTrainingModule):
             
             if hasattr(self.pipe.dit, "enable_fantasy_world_mode"):
                 self.pipe.dit.enable_fantasy_world_mode(training_stage=training_stage)
+                
+                # Load Fantasy World checkpoint (for Stage 2, load Stage 1 weights)
+                if fantasy_world_checkpoint is not None:
+                    print(f"\n{'='*80}")
+                    print(f"Loading Fantasy World Checkpoint")
+                    print(f"{'='*80}")
+                    print(f"Checkpoint: {fantasy_world_checkpoint}")
+                    print(f"Training stage: {training_stage}")
+                    
+                    from safetensors.torch import load_file as load_safetensors
+                    state_dict = load_safetensors(fantasy_world_checkpoint)
+                    
+                    # Load into DiT (strict=False allows missing keys for frozen blocks)
+                    missing_keys, unexpected_keys = self.pipe.dit.load_state_dict(state_dict, strict=False)
+                    
+                    print(f"Total keys loaded: {len(state_dict)}")
+                    print(f"Missing keys (frozen blocks): {len(missing_keys)}")
+                    print(f"Unexpected keys: {len(unexpected_keys)}")
+                    
+                    # Check if critical geometry modules are loaded
+                    geo_modules = [k for k in state_dict.keys() if 'geo_blocks' in k]
+                    print(f"Geometry modules loaded: {len(geo_modules)} keys")
+                    
+                    if len(geo_modules) == 0:
+                        print("⚠️  WARNING: No geometry modules found in checkpoint!")
+                    else:
+                        print("✓ Geometry modules successfully loaded")
+                    
+                    print(f"{'='*80}\n")
 
         self.task_to_loss = {
             "sft:data_process": lambda pipe, *args: args,
@@ -209,6 +239,7 @@ def wan_parser():
     parser.add_argument("--max_timestep_boundary", type=float, default=1.0, help="Max timestep boundary (for mixed models, e.g., Wan-AI/Wan2.2-I2V-A14B).")
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Min timestep boundary (for mixed models, e.g., Wan-AI/Wan2.2-I2V-A14B).")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
+    parser.add_argument("--fantasy_world_checkpoint", type=str, default=None, help="Path to Fantasy World checkpoint (Stage 1 output for Stage 2 training).")
     return parser
 
 
@@ -280,6 +311,7 @@ if __name__ == "__main__":
         device="cpu" if args.initialize_model_on_cpu else accelerator.device,
         max_timestep_boundary=args.max_timestep_boundary,
         min_timestep_boundary=args.min_timestep_boundary,
+        fantasy_world_checkpoint=args.fantasy_world_checkpoint,
     )
     model_logger = ModelLogger(
         args.output_path,

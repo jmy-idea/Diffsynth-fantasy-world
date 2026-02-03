@@ -26,7 +26,6 @@ OUTPUT_DIR="${PROJECT_ROOT}/outputs/fantasy_world_stage1"
 # Training Configuration
 export CUDA_VISIBLE_DEVICES=4,5  # Adjust based on your GPUs
 NUM_GPUS=2
-BATCH_SIZE_PER_GPU=1  # 1 * 2 = 2 global batch size
 GRADIENT_ACCUMULATION=1
 NUM_STEPS=20000
 LEARNING_RATE=1e-5
@@ -41,7 +40,6 @@ echo "Project root: ${PROJECT_ROOT}"
 echo "Data dir: ${DATA_DIR}"
 echo "Output dir: ${OUTPUT_DIR}"
 echo "Num GPUs: ${NUM_GPUS}"
-echo "Global batch size: $((BATCH_SIZE_PER_GPU * NUM_GPUS))"
 echo "Training steps: ${NUM_STEPS}"
 echo ""
 
